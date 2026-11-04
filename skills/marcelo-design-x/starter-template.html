@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>{{Brand}} — {{Tagline}}</title>
+<meta name="description" content="{{Emotional one-liner. Avoid 'leverage', 'optimize', 'AI-powered'}}." />
+
+<!-- Self-hosted fonts. Drop Aventa woff2 files into /assets/fonts/ — or sub Geist/Satoshi -->
+<style>
+@font-face {
+  font-family: "Aventa";
+  src: url("/assets/fonts/Aventa-Regular.woff2") format("woff2");
+  font-weight: 400; font-display: swap;
+}
+@font-face {
+  font-family: "Aventa";
+  src: url("/assets/fonts/Aventa-Bold.woff2") format("woff2");
+  font-weight: 700; font-display: swap;
+}
+@font-face {
+  font-family: "Orlean";
+  src: url("/assets/fonts/Orlean.woff2") format("woff2");
+  font-weight: 400; font-display: swap;
+}
+
+:root {
+  --bg: #0a0a0a;
+  --fg: #f5f2ec;
+  --accent: #ff8200;
+  --muted: rgba(245, 242, 236, 0.55);
+  --hairline: rgba(245, 242, 236, 0.12);
+  --ease: cubic-bezier(0.6, 0.01, 0.05, 0.95);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { background: var(--bg); color: var(--fg); font-family: "Aventa", system-ui, sans-serif; }
+body { overflow-x: hidden; }
+
+/* Loader (inlined so it appears before CSS file loads) */
+.loader { position: fixed; inset: 0; background: var(--bg); z-index: 100; display: grid; place-items: center; }
+.loader__counter { font-size: clamp(80px, 18vw, 240px); font-weight: 700; line-height: 1; letter-spacing: -0.04em; }
+.loader__bar { position: absolute; bottom: 10vh; left: 10vw; right: 10vw; height: 1px; background: var(--fg); transform-origin: 0 50%; transform: scaleX(0); }
+.loader__copy { position: absolute; top: 50%; left: 50%; transform: translate(-50%, calc(-50% + 14vh)); text-transform: uppercase; letter-spacing: 0.18em; font-size: 12px; color: var(--muted); }
+
+/* Hero */
+.hero { min-height: 100dvh; padding: 14vh 6vw 8vh; position: relative; overflow: hidden; }
+.hero__bg-layer { position: absolute; inset: 0; pointer-events: none; }
+.hero__bg-layer img { width: 100%; height: 100%; object-fit: cover; opacity: 0.6; mix-blend-mode: screen; }
+.hero__eyebrow { font-size: 11px; text-transform: uppercase; letter-spacing: 0.22em; color: var(--muted); margin-bottom: 2rem; }
+.hero h1 { font-size: clamp(48px, 8vw, 128px); font-weight: 700; letter-spacing: -0.02em; line-height: 0.95; max-width: 16ch; }
+.hero h1 .accent { font-family: "Orlean", "Aventa", serif; font-style: italic; font-weight: 400; color: var(--accent); }
+.hero__sub { margin-top: 2rem; max-width: 50ch; color: var(--muted); font-size: 18px; line-height: 1.55; }
+.hero__cta { margin-top: 3rem; display: inline-block; }
+
+/* Button */
+.btn { position: relative; display: inline-flex; align-items: center; gap: 0.5rem; height: 3rem; padding: 0 1.5rem; background: var(--accent); color: var(--bg); border: 0; border-radius: 999px; font: inherit; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; cursor: pointer; overflow: hidden; }
+.btn__label { display: inline-block; will-change: transform; }
+.btn__label--ghost { position: absolute; left: 1.5rem; top: 50%; transform: translateY(calc(-50% + 110%)); }
+.btn__icon { display: inline-flex; align-items: center; justify-content: center; width: 1.75rem; height: 1.75rem; border-radius: 999px; background: rgba(0,0,0,0.15); margin-left: 0.25rem; margin-right: -0.5rem; }
+
+/* Sections */
+.section { padding: 16vh 6vw; }
+.section h2 { font-size: clamp(36px, 5vw, 80px); font-weight: 600; line-height: 1.05; letter-spacing: -0.015em; max-width: 18ch; }
+.section h2 em { font-family: "Orlean", serif; font-style: italic; font-weight: 400; color: var(--accent); }
+
+/* Grid (filterable) */
+.grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 24px; margin-top: 6vh; }
+.card { grid-column: span 6; aspect-ratio: 4/3; background: rgba(255,255,255,0.03); border: 1px solid var(--hairline); border-radius: 24px; overflow: hidden; }
+.card:nth-child(3n+1) { grid-column: span 5; }
+.card:nth-child(3n+2) { grid-column: span 7; }
+
+/* Topbar */
+.topbar { position: fixed; top: 1.5rem; left: 50%; transform: translateX(-50%); display: flex; gap: 2rem; align-items: center; padding: 0.75rem 1.5rem; border-radius: 999px; background: rgba(10, 10, 10, 0.55); backdrop-filter: blur(18px); border: 1px solid var(--hairline); z-index: 50; transition: transform 0.4s var(--ease); }
+body[data-scrolling-direction="down"][data-scrolling-started="true"] .topbar { transform: translate(-50%, -120%); }
+
+@media (max-width: 768px) {
+  .hero { padding: 10vh 5vw 6vh; }
+  .grid { grid-template-columns: 1fr; }
+  .card, .card:nth-child(3n+1), .card:nth-child(3n+2) { grid-column: 1 / -1; }
+}
+</style>
+</head>
+
+<body data-active-bar="dark">
+
+<!-- LOADER -->
+<div class="loader" data-loader>
+  <div class="loader__counter" data-loader-counter>0</div>
+  <div class="loader__bar" data-loader-bar></div>
+  <div class="loader__copy" data-loader-copy>Brewing your experience</div>
+</div>
+
+<!-- TOPBAR -->
+<header class="topbar" data-loader-fade-element-negative>
+  <a href="/" data-force-sroll-to="#hero">{{Brand}}</a>
+  <nav>
+    <a href="#projects" data-force-sroll-to="#projects">Projects</a>
+    <a href="#services" data-force-sroll-to="#services">Services</a>
+  </nav>
+  <a href="#contact" class="btn" data-btn-hover>
+    <span class="btn__label" data-label>Let's Talk</span>
+    <span class="btn__label btn__label--ghost" aria-hidden="true">Let's Talk</span>
+  </a>
+</header>
+
+<!-- HERO -->
+<section class="hero" id="hero" data-leave-section="dark">
+  <div class="hero__bg-layer" aria-hidden="true">
+    <img src="/assets/img/hero-layer.webp" alt="" data-fade-autoalpha />
+  </div>
+  <p class="hero__eyebrow" data-loader-fade-element-positive>Made with Intention</p>
+  <h1 data-split-headline>
+    Design That Feels.<br />
+    <span class="accent">Experiences That Resonate.</span>
+  </h1>
+  <p class="hero__sub" data-fade-y data-fade-delay="0.3">
+    {{One emotional sentence. Use words like feel, breathe, resonate. ≤25 words.}}
+  </p>
+  <a href="#contact" class="btn hero__cta" data-btn-hover data-fade-y data-fade-delay="0.5">
+    <span class="btn__label" data-label>Let's Talk</span>
+    <span class="btn__label btn__label--ghost" aria-hidden="true">Let's Talk</span>
+    <span class="btn__icon">›</span>
+  </a>
+</section>
+
+<!-- ATMOSPHERE -->
+<section class="section" data-leave-section="dark">
+  <h2 data-split-headline>Every experience<br /><em>begins with a feeling.</em></h2>
+</section>
+
+<!-- PROJECTS — filterable -->
+<section class="section" id="projects" data-leave-section="dark">
+  <h2 data-fade-clip>Our craft, your expression.</h2>
+
+  <div class="filter" data-fade-y>
+    <button data-filter-target="all" data-filter-status="active">All</button>
+    <button data-filter-target="ui">UI/UX</button>
+    <button data-filter-target="dev">Development</button>
+    <button data-filter-target="brand">Branding</button>
+  </div>
+
+  <div class="grid" data-filter-group>
+    <article class="card" data-filter-tags="ui,dev"   data-fade-scale></article>
+    <article class="card" data-filter-tags="ui"       data-fade-scale></article>
+    <article class="card" data-filter-tags="dev"      data-fade-scale></article>
+    <article class="card" data-filter-tags="brand"    data-fade-scale></article>
+    <article class="card" data-filter-tags="ui,brand" data-fade-scale></article>
+    <article class="card" data-filter-tags="dev"      data-fade-scale></article>
+  </div>
+</section>
+
+<!-- CONTACT -->
+<section class="section" id="contact" data-leave-section="dark">
+  <h2 data-split-headline>Turn your vision<br /><em>into something lasting.</em></h2>
+  <form action="/api/contact" method="POST" data-form-validate data-fade-y>
+    <!-- inputs ... -->
+    <button type="submit" class="btn" data-btn-hover>
+      <span class="btn__label" data-label>Send</span>
+      <span class="btn__label btn__label--ghost" aria-hidden="true">Send</span>
+    </button>
+    <p data-form-status-message></p>
+  </form>
+</section>
+
+<!-- LIBS -->
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/gsap.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/ScrollTrigger.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/CustomEase.min.js"></script>
+<script src="https://unpkg.com/lenis@1.3.4/dist/lenis.min.js"></script>
+<!-- If you have Club GSAP, also add SplitText, Flip, Draggable, InertiaPlugin -->
+
+<script type="module" src="/dist/js/pages/homepage.min.js"></script>
+<!-- homepage.min.js: see animation-system.md for the boot script -->
+
+</body>
+</html>

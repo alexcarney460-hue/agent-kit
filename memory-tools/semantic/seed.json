@@ -1,0 +1,4 @@
+{
+  "_note": "Entity seed for this machine's memory. Add the people, projects and tools you work with (slug, kind, name, aliases, summary), then run `python ~/.claude/memory-tools/sem.py seed` (it upserts by slug and never deletes).",
+  "entities": []
+}
