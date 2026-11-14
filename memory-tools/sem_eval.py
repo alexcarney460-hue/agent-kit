@@ -29,16 +29,10 @@ import sem
 # These are placeholder pairs for the fictional seed world — EDIT to real
 # entities from YOUR memory once it has content, or every case reports no gold.
 CASES: list[tuple[str, str, str]] = [
-    ("legal name -> common name", "Jamie Rivera", "Jamie Alexandra Rivera"),
-    ("github handle -> person",   "Jamie Rivera", "jrivera-dev"),
-    ("email handle -> person",    "Morgan Lee",  "morganl"),
-    ("description -> entity",     "Acme Holdings LLC", "the parent company"),
-    ("description -> entity 2",   "Acme Logistics LLC", "the operating company"),
-    ("firm -> lawyer",            "Casey Brook", "brook-legal.example"),
-    ("product -> repo",           "Acme CRM",    "acme-crm"),
-    ("acronym -> full name",      "Northwind Finance", "NWF"),
-    ("informal -> artifact",      "contractor agreement", "my contract"),
-    ("vendor -> creditor",        "Contoso Supplies", "main supplier"),
+    ("person alias", "Sample Person", "example-person"),
+    ("company alias", "Example Co", "example-organization"),
+    ("document alias", "example service agreement", "sample document"),
+    ("project alias", "Example Project", "sample-project"),
 ]
 
 

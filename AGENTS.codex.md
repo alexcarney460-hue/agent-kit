@@ -1,4 +1,4 @@
-# Global agent instructions (installed by agent-kit v3)
+# Global agent instructions (installed by agent-kit v4)
 
 These instructions come from Alex's agent setup, adapted for Codex. They give you a
 memory that persists between sessions, a set of working rules, and a library of skills.

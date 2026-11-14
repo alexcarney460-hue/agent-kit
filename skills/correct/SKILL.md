@@ -13,7 +13,7 @@ Assume every contributor is an agent that sees only the files it opened, copies 
 
 ## 1. Take a census of mistake classes
 
-Read recent commits, reverts, review comments, the repo's agent file (AGENTS.md / CLAUDE.md), comments that explain workarounds, and our own record: `python3 ~/.claude/memory-tools/mem_recall.py "<repo> correction"`, `~/tasks/lessons.md` and `~/.claude/tasks/lessons.md` (whichever exist on the machine). Group what you find into classes and count each. A class counts once it has happened twice. A one-off gets named and no new check.
+Read recent commits, reverts, review comments, the repo's agent file (AGENTS.md / CLAUDE.md), comments that explain workarounds, and our own record: the installed memory tools (`python "$HOME/.claude/memory-tools/mem_recall.py" "repo correction"`; use the Python that installed the kit, `python`, `py -3` or `python3`). Group what you find into classes and count each. A class counts once it has happened twice. A one-off gets named and no new check.
 
 ## 2. Pick the highest level that works, per class
 

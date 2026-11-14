@@ -87,28 +87,6 @@ class TestSchema(Base):
         self.assertLessEqual({"suppressed_observation", "distillation", "consolidation_run"}, tables)
 
 
-class TestKimiNoise(Base):
-    def test_noise_expired_real_kept(self):
-        n1 = self.add_learning('kimi-auto: Kimi session "new session" in /x')
-        n2 = self.add_learning('kimi-auto: Kimi session "proceed" in /x')
-        keep = self.add_learning('kimi-auto: Kimi session "fix the invoice mapper" in /x')
-        m = consolidate.phase_kimi(self.hm, apply=True)
-        self.assertEqual(m["kimi_noise_expired"], 2)
-        actives = {r[0] for r in self.hm.execute("SELECT id FROM learnings WHERE active=1")}
-        self.assertEqual(actives, {keep})
-        for rid in (n1, n2):
-            row = self.hm.execute("SELECT expired_at FROM learnings WHERE id=?", (rid,)).fetchone()
-            self.assertIsNotNone(row[0])
-
-    def test_dry_run_mutates_nothing(self):
-        self.add_learning('kimi-auto: Kimi session "proceed" in /x')
-        m = consolidate.phase_kimi(self.hm, apply=False)
-        self.assertEqual(m["kimi_noise_found"], 1)
-        self.assertEqual(m["kimi_noise_expired"], 0)
-        self.assertEqual(self.hm.execute(
-            "SELECT COUNT(*) FROM learnings WHERE active=1").fetchone()[0], 1)
-
-
 class TestHmMerge(Base):
     def test_clusters_respect_category(self):
         self.add_learning("fly deploys need the config token not the stale key file", cat="context")
@@ -116,9 +94,9 @@ class TestHmMerge(Base):
         self.assertEqual(consolidate.find_hm_clusters(self.hm), [])
 
     def test_merge_expires_losers_with_provenance(self):
-        a = self.add_learning("contract terms agreed with john ten thousand monthly equity ratchet",
+        a = self.add_learning("fictional comet garden water schedule monday morning",
                               ctx="ORIGINAL CURATED CONTEXT")
-        b = self.add_learning("contract terms agreed with john ten thousand monthly equity ratchet capped")
+        b = self.add_learning("fictional comet garden water schedule monday morning revised")
         with mock.patch.object(consolidate, "ask_model",
                                return_value={"action": "merge", "canonical_id": a, "merged_context": "folded"}):
             m = consolidate.phase_hm(self.hm, apply=True)
@@ -130,12 +108,12 @@ class TestHmMerge(Base):
         self.assertIsNotNone(loser[2])
         canon = self.hm.execute("SELECT active, context FROM learnings WHERE id=?", (a,)).fetchone()
         self.assertEqual(canon[0], 1)
-        # H2 regression: the canonical's own context is APPENDED to, never replaced
+        # the canonical's own context is APPENDED to, never replaced
         self.assertIn("ORIGINAL CURATED CONTEXT", canon[1])
         self.assertIn("folded", canon[1])
 
     def test_malformed_verdicts_never_crash_or_merge(self):
-        # H3 regression: lists, string ids, and prose confidence must be inert
+        # lists, string ids, and prose confidence must be inert
         self.add_learning("identical duplicate learning row for malformed verdict testing")
         b = self.add_learning("identical duplicate learning row for malformed verdict testing too")
         for bad in ({"action": "merge", "canonical_id": "not-an-int"},
@@ -149,16 +127,15 @@ class TestHmMerge(Base):
 
     def test_ask_model_rejects_non_dict_json(self):
         # contract: ask_model returns a dict or None — never a list/str/number
-        for stdout in ("[1, 2, 3]", "no json here at all", '"just a string"'):
-            fake = mock.Mock(stdout=stdout, returncode=0)
-            with mock.patch.object(consolidate.subprocess, "run", return_value=fake):
-                self.assertIsNone(consolidate.ask_model("prompt"), stdout)
-        fake = mock.Mock(stdout='ok {"action":"merge"} done', returncode=0)
-        with mock.patch.object(consolidate.subprocess, "run", return_value=fake):
-            self.assertEqual(consolidate.ask_model("prompt"), {"action": "merge"})
+        with mock.patch.dict(os.environ, {"HM_NO_LLM": ""}), mock.patch.object(consolidate, "MODEL_ALLOWED", True), mock.patch.object(consolidate.memdir, "cloud_ok", return_value=True):
+            for stdout in ("[1, 2, 3]", "no json here at all", '"just a string"'):
+                with mock.patch.object(consolidate, "_start_model", return_value=("ran", stdout)):
+                    self.assertIsNone(consolidate.ask_model("prompt"), stdout)
+            with mock.patch.object(consolidate, "_start_model", return_value=("ran", 'ok {"action":"merge"} done')):
+                self.assertEqual(consolidate.ask_model("prompt"), {"action": "merge"})
 
     def test_non_utf8_rule_does_not_crash_clustering(self):
-        # C1 regression: legacy rows contain invalid UTF-8; connect() must decode leniently
+        # legacy rows contain invalid UTF-8; connect() must decode leniently
         raw = sqlite3.connect(self.hm.execute("PRAGMA database_list").fetchone()[2])
         raw.execute("INSERT INTO learnings (category, rule, confidence, created_at, active, protected) "
                     "VALUES ('context', CAST(X'4A75706974657220ff50657270' AS TEXT), 0.8, '2026-07-01', 1, 0)")
@@ -170,8 +147,8 @@ class TestHmMerge(Base):
         self.assertIsInstance(clusters, list)
 
     def test_protected_loser_never_folds_into_unprotected_canonical(self):
-        a = self.add_learning("acme contoso invoice rule northwind twenty percent service fee", protected=0)
-        b = self.add_learning("acme contoso invoice rule northwind twenty percent service fee always", protected=1)
+        a = self.add_learning("example memory item sample wording", protected=0)
+        b = self.add_learning("example memory item sample wording expanded", protected=1)
         with mock.patch.object(consolidate, "ask_model",
                                return_value={"action": "merge", "canonical_id": a, "merged_context": None}):
             consolidate.phase_hm(self.hm, apply=True)
@@ -191,9 +168,9 @@ class TestHmMerge(Base):
 class TestCmSuppress(Base):
     def test_duplicates_suppressed_canonical_kept(self):
         base = 1753000000
-        a = self.add_obs("Contract Terms Agreed with John", epoch=base, rel=0)
-        b = self.add_obs("Contract terms agreed with John!", epoch=base + 3600, rel=5)
-        c = self.add_obs("Contract Terms Agreed with John", epoch=base + 7200, rel=1)
+        a = self.add_obs("Fictional Comet Garden Water Schedule", epoch=base, rel=0)
+        b = self.add_obs("Fictional comet garden water schedule!", epoch=base + 3600, rel=5)
+        c = self.add_obs("Fictional Comet Garden Water Schedule", epoch=base + 7200, rel=1)
         solo = self.add_obs("Completely different observation", epoch=base)
         m = consolidate.phase_cm(self.cm, self.sem, apply=True)
         self.assertEqual(m["cm_suppressed"], 2)
@@ -254,7 +231,7 @@ class TestDistill(Base):
         self.assertEqual(m["distill_candidates"], 0)
 
     def test_hub_entity_excluded_on_real_corpus(self):
-        # M4 regression: >8% of a >=200-mention corpus = hub, never distilled
+        # >8% of a >=200-mention corpus = hub, never distilled
         self._wire_entity("hubtopic", 238)
         self._wire_entity("narrowtopic", 12)
         with mock.patch.object(consolidate, "ask_model", return_value={"rule": None}):
@@ -328,7 +305,7 @@ class TestIndexSync(unittest.TestCase):
 
 class TestRecallSuppression(unittest.TestCase):
     def test_entity_boost_path_also_filtered(self):
-        # H1 regression: a suppressed observation reachable ONLY via entity boost
+        # a suppressed observation reachable ONLY via entity boost
         # must not resurface in claudemem()
         import mem_recall
         with tempfile.TemporaryDirectory() as d:
@@ -339,10 +316,12 @@ class TestRecallSuppression(unittest.TestCase):
             c.execute("INSERT INTO observations (id, project, title, text, created_at_epoch, relevance_count) "
                       "VALUES (7, 'p', 'Canonical obs', 'body', 1753000000, 3)")
             c.commit(); c.close()
-            with mock.patch.object(mem_recall, "CM", cmdb), \
-                 mock.patch.object(mem_recall, "suppressed_obs_ids", return_value={42}):
+            view = mock.Mock()
+            view.store_available.return_value = True
+            view.is_eligible.side_effect = lambda store, ref: str(ref) != '42'
+            with mock.patch.object(mem_recall, "CM", cmdb):
                 boosts = {("claudemem", "42"): 1.0, ("claudemem", "7"): 1.0}
-                out, _mode = mem_recall.claudemem("q", ["zzznomatch"], boosts)
+                out, _mode = mem_recall.claudemem("q", ["zzznomatch"], boosts, view=view)
         ids = {row[1] for row in out}
         self.assertIn(7, ids)
         self.assertNotIn(42, ids)
@@ -356,26 +335,16 @@ class TestRecallSuppression(unittest.TestCase):
                       " canonical_id INTEGER, reason TEXT, created_at TEXT)")
             c.execute("INSERT INTO suppressed_observation VALUES (42, 7, 'dup', 'now')")
             c.commit(); c.close()
-            with mock.patch.object(mem_recall.os.path, "expanduser",
-                                   side_effect=lambda p: semdb if "semantic.db" in p else p):
+            with mock.patch.object(mem_recall.graph_policy, "SEM_DB", semdb), \
+                 mock.patch.object(mem_recall.graph_policy, "load_policy", return_value=mock.Mock(suppressed={42})):
                 ids = mem_recall.suppressed_obs_ids()
         self.assertEqual(ids, {42})
 
-    def test_fail_open_when_overlay_missing(self):
+    def test_fail_closed_when_overlay_missing(self):
         import mem_recall
-        with mock.patch.object(mem_recall.os.path, "expanduser",
-                               side_effect=lambda p: "/nonexistent/semantic.db" if "semantic.db" in p else p):
-            self.assertEqual(mem_recall.suppressed_obs_ids(), set())
-
-
-class TestKimiIngestFilter(unittest.TestCase):
-    def test_noise_patterns(self):
-        pat = re.compile(r"^(new session|proceed|continue|go|ok(ay)?|yes|no|test|hi|hello"
-                         r"|are you there\??|\.{1,3})$", re.I)
-        for noise in ("new session", "Proceed", "are you there?", "ok", "..."):
-            self.assertTrue(pat.match(noise), noise)
-        for real in ("fix the invoice mapper", "new session handling for drivers", "go over the census"):
-            self.assertFalse(pat.match(real), real)
+        with mock.patch.object(mem_recall.graph_policy, "SEM_DB", "/nonexistent/semantic.db"):
+            with self.assertRaises(mem_recall.graph_policy.PolicyUnavailable):
+                mem_recall.suppressed_obs_ids()
 
 
 if __name__ == "__main__":

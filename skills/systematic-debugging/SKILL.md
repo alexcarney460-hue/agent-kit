@@ -90,11 +90,12 @@ You MUST complete each phase before proceeding to the next.
    ```bash
    # Layer 1: Workflow
    echo "=== Secrets available in workflow: ==="
-   echo "IDENTITY: ${IDENTITY:+SET}${IDENTITY:-UNSET}"
+   # Report only whether the variable is set. Never print a secret's value into a log.
+   if [ -n "${IDENTITY:-}" ]; then echo "IDENTITY: SET"; else echo "IDENTITY: UNSET"; fi
 
    # Layer 2: Build script
    echo "=== Env vars in build script: ==="
-   env | grep IDENTITY || echo "IDENTITY not in environment"
+   if env | grep -q "^IDENTITY="; then echo "IDENTITY is in the environment"; else echo "IDENTITY not in environment"; fi
 
    # Layer 3: Signing script
    echo "=== Keychain state: ==="

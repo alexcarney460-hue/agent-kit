@@ -100,7 +100,7 @@ cd "$path"
 
 ### 3. Run Project Setup
 
-Auto-detect and run appropriate setup:
+Detect which setup the project needs, tell the user the exact command, and ask before running it: these commands download and run code from package registries.
 
 ```bash
 # Node.js

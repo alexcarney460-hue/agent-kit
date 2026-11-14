@@ -1,40 +1,34 @@
 #!/usr/bin/env python3
-"""mem_recall — one-call unified retrieval across all memory stores.
-
-Replaces "the agent must know which store + the exact incantation". Fans a query
-to: hivemind learnings, claude-mem observations, file memories (+ gbrain if its
-CLI is present), ranks by relevance x reinforced-confidence, PINS protected
-hits to the top, and (read-side reinforcement loop) bumps times_applied/last_applied
-on surfaced hivemind rows and relevance_count on surfaced observations.
-
-It sits on the SEMANTIC LAYER (sem.py):
-  * the query resolves to canonical entities via aliases, so "Jamie Alexandra
-    Rivera" and "Jamie Rivera" hit the same records;
-  * records linked to a resolved entity are retrievable with ZERO lexical overlap
-    with the query — the thing pure string matching cannot do. Those are marked ⊕;
-  * claude-mem is searched through its FTS5 index instead of a LIKE table scan
-    (~4x the recall on the same query, and it was already built).
-The layer is optional: if semantic.db is missing or broken, recall degrades to the
-previous lexical behaviour and says so.
-
-NON-DESTRUCTIVE: only SELECTs + counter increments. No content is changed/removed.
-
-Usage: mem_recall.py "your query" [--k 8] [--no-bump] [--no-semantic]
-"""
+"""Search local memories using lexical, optional vector and graph signals."""
 import argparse, os, sqlite3, sys, re, math, datetime, time, random, shutil, subprocess
+import heapq
+from contextlib import closing
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import graph_policy
+import memdir
+import json
 try:
     import sem
-except Exception:  # layer absent -> lexical-only, never fatal
+except Exception:  # layer absent -> lexical-only ranking, never fatal
     sem = None
 
-from memdir import memory_dir  # noqa: E402 (path inserted above)
+HM = graph_policy.HIVEMIND_DB
+CM = graph_policy.CLAUDEMEM_DB
+MEMDIR = graph_policy.MEMDIR
+def _protected_pattern():
+    try:
+        with open(os.path.join(memdir.tools_dir(), "protected-topics.json"), encoding="utf-8") as f:
+            topics = json.load(f)
+        if not isinstance(topics, list):
+            return re.compile(r"(?!)")
+        topics = [re.escape(item) for item in topics if isinstance(item, str) and item.strip()]
+        return re.compile("|".join(topics) if topics else r"(?!)", re.I)
+    except (OSError, ValueError):
+        return re.compile(r"(?!)")
 
-HM = os.path.expanduser("~/hivemind.db")
-CM = os.path.expanduser("~/.claude-mem/claude-mem.db")
-MEMDIR = memory_dir()
-PROTECT_RE = re.compile(r"client-a|project-b|partner-name", re.I)  # EDIT: keywords whose memories get pinned/protected — your ventures, clients, partners
+PROTECT_RE = _protected_pattern()
 
 # how hard an entity link outranks a raw keyword hit (one keyword hit == 2.0)
 ENTITY_BOOST = 6.0
@@ -47,7 +41,7 @@ def terms(q):
 def conn(path):
     c = sqlite3.connect(path, timeout=10)
     c.execute("PRAGMA busy_timeout=5000;")
-    # tolerate legacy non-UTF-8 bytes in old rows instead of crashing recall
+    # Tolerate legacy non-UTF-8 bytes instead of crashing recall.
     c.text_factory = lambda b: b.decode("utf-8", "replace") if isinstance(b, (bytes, bytearray)) else b
     return c
 
@@ -73,9 +67,9 @@ def recency(iso_or_epoch):
         return 0.5
 
 def hm_redirects():
-    """{expired_id(str): active_root_id(str)} following superseded_by chains.
-    The expired text is the old vocabulary for a live fact; recall credits the
-    root. Cycle-safe; fail-open to empty."""
+    """{expired_id(str): active_root_id(str)} following superseded_by chains
+    (local3381). The expired text is the old vocabulary for a live fact; recall
+    credits the root. Cycle-safe; fail-open to empty."""
     try:
         c = conn(HM)
         state = {r[0]: (r[1], r[2]) for r in retry(lambda: c.execute(
@@ -98,8 +92,10 @@ def hm_redirects():
         return {}
 
 
-def hivemind(q, tg, boosts):
+def hivemind(q, tg, boosts, view=None):
     out = []
+    if view is not None and not view.store_available("hivemind"):
+        return out
     try:
         c = conn(HM)
         rows = retry(lambda: c.execute(
@@ -122,14 +118,16 @@ def hivemind(q, tg, boosts):
                     rk = int(root)
                     redirect_extra[rk] = max(redirect_extra.get(rk, 0.0), xhits * 0.8)
         for rid, cat, rule, ctx, cf, th, cre, la, prot in rows:
+            if view is not None and not view.is_eligible("hivemind", rid):
+                continue
             blob = f"{rule} {ctx or ''}".lower()
             hits = sum(blob.count(t) for t in tg)
             extra = redirect_extra.get(rid, 0.0)
             eb = boosts.get(("hivemind", str(rid)), 0.0)
             if hits == 0 and extra == 0.0 and eb == 0.0 and not (prot and PROTECT_RE.search(blob)):
                 continue
-            wgt = (cf or 0.5) * recency(la or cre) * (1 + math.log1p(th or 0))
-            score = (hits + extra) * 2 + wgt + (5 if prot else 0) + ENTITY_BOOST * eb
+            eff = (cf or 0.5) * recency(la or cre) * (1 + math.log1p(th or 0))
+            score = (hits + extra) * 2 + eff + (5 if prot else 0) + ENTITY_BOOST * eb
             # grounded = real evidence (keyword, redirect, or entity); protected
             # floaters are display-only and must not vote in RRF fusion
             out.append((score, rid, prot, cat, (rule or "")[:160],
@@ -141,63 +139,186 @@ def hivemind(q, tg, boosts):
     out.sort(key=lambda r: -r[0])
     return out
 
-def _cm_lexical(c, tg):
-    """FTS5 when the index exists, else the old LIKE scan. Returns {id: row}."""
+CM_FTS_POOL_LIMIT = 600
+CM_LIKE_POOL_LIMIT = 400
+CM_BODY_SQL = ("COALESCE(o.text,'') || ' ' || COALESCE(o.facts,'') "
+               "|| ' ' || COALESCE(o.narrative,'')")
+CM_FIELDS_SQL = (f"o.id, COALESCE(o.title,''), {CM_BODY_SQL}, "
+                 "o.created_at_epoch, COALESCE(o.relevance_count,0)")
+CM_NEWEST_SQL = "o.created_at_epoch DESC, o.id DESC"
+
+
+def _cm_like(connection, query_terms):
+    """Bounded relevance and recency pools when FTS5 is unavailable."""
+    content = f"lower(COALESCE(o.title,'') || ' ' || {CM_BODY_SQL})"
+    title_content = "lower(COALESCE(o.title,''))"
+    body_content = f"lower({CM_BODY_SQL})"
+    predicate = " OR ".join(f"{content} LIKE ?" for term in query_terms)
+    relevance = " + ".join(
+        f"((length({title_content}) - length(replace({title_content}, ?, ''))) / ? "
+        f"+ (instr({body_content}, ?) > 0))"
+        for term in query_terms)
+    matches = tuple(f"%{term}%" for term in query_terms)
+    weights = tuple(value for term in query_terms for value in (term, len(term), term))
+    statement = f"SELECT {CM_FIELDS_SQL} FROM observations o WHERE {predicate} "
+    relevant = retry(lambda: connection.execute(
+        statement + f"ORDER BY {relevance} DESC, {CM_NEWEST_SQL} LIMIT ?",
+        (*matches, *weights, CM_LIKE_POOL_LIMIT)).fetchall())
+    recent = retry(lambda: connection.execute(
+        statement + f"ORDER BY {CM_NEWEST_SQL} LIMIT ?",
+        (*matches, CM_LIKE_POOL_LIMIT)).fetchall())
+    return {row[0]: row for row in (*relevant, *recent)}
+
+
+CM_FTS_TIE_MARGIN = 200   # ranked rows read past the pool, to settle equal ranks at its edge by newest
+CM_TIME_INDEX = "idx_observations_created"
+
+
+def _cm_rows(connection, ids):
+    """{id: row} for the observations among `ids` that exist."""
     rows = {}
+    for start in range(0, len(ids), 400):
+        chunk = ids[start:start + 400]
+        marks = ",".join("?" * len(chunk))
+        for row in retry(lambda: connection.execute(
+                f"SELECT {CM_FIELDS_SQL} FROM observations o WHERE o.id IN ({marks})", chunk).fetchall()):
+            rows[row[0]] = row
+    return rows
+
+
+class _Reversed:
+    """Sorts in the reverse of its value's order: a descending key part for values that cannot be negated."""
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+    def __lt__(self, other):
+        return other.value < self.value
+
+    def __eq__(self, other):
+        return self.value == other.value
+
+
+def _cm_newest_key(row):
+    """Sort key for CM_NEWEST_SQL (created_at_epoch DESC, id DESC) as SQLite orders it.
+
+    The column should hold a number, but SQLite stores whatever it is given; descending, it puts bytes first,
+    then text, then numbers, then no value."""
+    value = row[3]
+    if value is None:
+        kind, part = 3, 0
+    elif isinstance(value, (int, float)):
+        kind, part = 2, -value
+    elif isinstance(value, str):
+        kind, part = 1, _Reversed(value.encode("utf-8", "surrogatepass"))
+    else:
+        kind, part = 0, _Reversed(bytes(value))
+    return (kind, part, -row[0])
+
+
+def _cm_fts_relevant(connection, match, limit):
+    """Rows of the `limit` best-ranked matches, best first; equal rank goes to the newest.
+
+    The ranking is read from the search index alone and only the winners' rows are fetched. One joined
+    joined statement would fetch every matching row before sorting."""
+    want = limit + CM_FTS_TIE_MARGIN
+    while True:
+        ranked = retry(lambda: connection.execute(
+            "SELECT rowid, rank FROM observations_fts WHERE observations_fts MATCH ? ORDER BY rank LIMIT ?",
+            (match, want)).fetchall())
+        rank = {row[0]: row[1] for row in ranked}
+        best = sorted(_cm_rows(connection, list(rank)).values(), key=lambda row: (rank[row[0]], *_cm_newest_key(row)))
+        # complete once no unread match can enter the pool: every match was read, or the last one read ranks
+        # strictly below the pool's last place (an equal rank could still be newer)
+        if len(ranked) < want or (len(best) >= limit and ranked[-1][1] != rank[best[limit - 1][0]]):
+            return best[:limit]
+        want *= 4
+
+
+def _cm_fts_recent(connection, match, limit):
+    """ids of the `limit` newest matches, newest first, by walking the time index and testing each entry
+    against the matches. Left to itself the planner fetches every matching row and sorts (6 s)."""
+    statement = ("SELECT o.id FROM observations o {hint}WHERE o.id IN "
+                 "(SELECT rowid FROM observations_fts WHERE observations_fts MATCH ?) "
+                 f"ORDER BY {CM_NEWEST_SQL} LIMIT ?")
     try:
-        match = " OR ".join(f'"{t}"' for t in tg)
-        r = retry(lambda: c.execute(
-            "SELECT o.id,o.title,COALESCE(o.text,''),o.created_at_epoch,COALESCE(o.relevance_count,0) "
-            "FROM observations_fts f JOIN observations o ON o.id=f.rowid "
-            "WHERE observations_fts MATCH ? LIMIT 600", (match,)).fetchall())
-        for x in r:
-            rows[x[0]] = x
+        return [row[0] for row in retry(lambda: connection.execute(
+            statement.format(hint=f"INDEXED BY {CM_TIME_INDEX} "), (match, limit)).fetchall())]
+    except sqlite3.OperationalError as exc:
+        if "no such index" not in str(exc):
+            raise
+    return [row[0] for row in retry(lambda: connection.execute(statement.format(hint=""), (match, limit)).fetchall())]
+
+
+def _cm_lexical(connection, query_terms):
+    """Union relevant and recent matches without starving either pool."""
+    if not query_terms:
+        return {}, "none"
+    try:
+        match = " OR ".join('"' + term.replace('"', '""') + '"' for term in query_terms)
+        relevant = _cm_fts_relevant(connection, match, CM_FTS_POOL_LIMIT)
+        rows = {row[0]: row for row in relevant}
+        recent = _cm_fts_recent(connection, match, CM_FTS_POOL_LIMIT)
+        fetched = _cm_rows(connection, [oid for oid in recent if oid not in rows])
+        for oid in recent:
+            if oid not in rows and oid in fetched:
+                rows[oid] = fetched[oid]
         return rows, "fts5"
     except sqlite3.Error:
-        like = " OR ".join(
-            ["lower(title||' '||COALESCE(text,'')||' '||COALESCE(facts,'')||' '||COALESCE(narrative,'')) LIKE ?"] * len(tg))
-        r = retry(lambda: c.execute(
-            f"SELECT id,title,COALESCE(text,''),created_at_epoch,COALESCE(relevance_count,0) "
-            f"FROM observations WHERE {like} LIMIT 400", [f"%{t}%" for t in tg]).fetchall())
-        for x in r:
-            rows[x[0]] = x
-        return rows, "like"
+        return _cm_like(connection, query_terms), "like"
 
 def suppressed_obs_ids():
-    """Consolidation overlay: observation ids collapsed as duplicates.
-    Lives in semantic.db so the plugin's DB stays untouched. Fail-open to none."""
+    """Consolidation overlay (local3366): observation ids collapsed as duplicates.
+    Lives in semantic.db so the plugin's DB stays untouched. FAIL-CLOSED: raises
+    graph_policy.PolicyUnavailable when the overlay cannot be established —
+    an unreadable overlay is never an empty exclusion set."""
     try:
-        c = conn(os.path.expanduser("~/.claude/memory-tools/semantic.db"))
-        ids = {r[0] for r in c.execute("SELECT obs_id FROM suppressed_observation")}
+        c = graph_policy.open_ro(graph_policy.SEM_DB)
+    except sqlite3.Error as exc:
+        raise graph_policy.PolicyUnavailable(f"overlay_db:{type(exc).__name__}") from exc
+    try:
+        return set(graph_policy.load_policy(c).suppressed)
+    finally:
         c.close()
-        return ids
-    except Exception:
-        return set()
 
-def claudemem(q, tg, boosts):
+def claudemem(q, tg, boosts, view=None):
+    """claude-mem candidates. `view` is the eligibility view; when it says the
+    store is unavailable (privacy overlay unreadable) NOTHING is returned and
+    the mode is 'unavailable' — distinct from 'no results'."""
     out, mode = [], "none"
+    if view is None:
+        try:
+            view = _load_view()
+        except graph_policy.GraphUnavailable as exc:
+            view = graph_policy.fallback_view(exc.reason)
+    if not view.store_available("claudemem"):
+        return out, "unavailable"
     try:
         c = conn(CM)
         rows, mode = _cm_lexical(c, tg)
-        sup = suppressed_obs_ids()
-        for sid in sup:
-            rows.pop(sid, None)
+        for sid in list(rows):
+            if not view.is_eligible("claudemem", sid):
+                rows.pop(sid, None)
         lexical_ids = set(rows)
         # entity-linked observations, fetched even with zero lexical overlap —
-        # the suppression overlay applies to this path too, or collapsed dups
+        # the eligibility view applies to this path too, or collapsed dups
         # resurface on exactly the entity queries the layer was built for
         ids = [int(ref) for (store, ref) in boosts if store == "claudemem" and str(ref).isdigit()]
-        ids = [i for i in ids if i not in lexical_ids and i not in sup]
+        ids = [i for i in ids if i not in lexical_ids and view.is_eligible("claudemem", i)]
         for chunk in (ids[i:i + 400] for i in range(0, len(ids), 400)):
             marks = ",".join("?" * len(chunk))
             r = retry(lambda: c.execute(
-                f"SELECT id,title,COALESCE(text,''),created_at_epoch,COALESCE(relevance_count,0) "
-                f"FROM observations WHERE id IN ({marks})", chunk).fetchall())
+                f"SELECT {CM_FIELDS_SQL} "
+                f"FROM observations o WHERE o.id IN ({marks})", chunk).fetchall())
             for x in r:
-                rows[x[0]] = x
+                if view.is_eligible("claudemem", x[0]):
+                    rows[x[0]] = x
         for oid, title, text, ep, rel in rows.values():
-            blob = f"{title} {text}".lower()
-            hits = sum(blob.count(t) for t in tg)
+            title_lower = (title or "").lower()
+            body_lower = (text or "").lower()
+            blob = f"{title_lower} {body_lower}"
+            hits = sum(title_lower.count(term) + int(term in body_lower) for term in tg)
             eb = boosts.get(("claudemem", str(oid)), 0.0)
             prot = 1 if PROTECT_RE.search(blob) else 0
             score = hits * 2 + recency(ep) + (1 + math.log1p(rel)) + (4 if prot else 0) + ENTITY_BOOST * eb
@@ -208,11 +329,14 @@ def claudemem(q, tg, boosts):
     out.sort(key=lambda r: -r[0])
     return out, mode
 
-def files(q, tg, boosts):
+def files(q, tg, boosts, view=None):
     out = []
+    if view is not None and not view.store_available("file"):
+        return out
     try:
         for fn in os.listdir(MEMDIR):
             if not fn.endswith(".md"): continue
+            if view is not None and not view.is_eligible("file", fn): continue
             p = os.path.join(MEMDIR, fn)
             txt = open(p, encoding="utf-8", errors="ignore").read().lower()
             hits = sum(txt.count(t) for t in tg)
@@ -226,37 +350,114 @@ def files(q, tg, boosts):
     return out
 
 # ---------------------------------------------------------------------------
-# Hybrid fusion: lexical + vector + graph signals merged by RRF.
+
 # Rank-based fusion sidesteps the incomparable per-store score formulas.
 # ---------------------------------------------------------------------------
-RRF_K = 60
-VECTOR_WEIGHT = 2.5      # one cross-store list vs three lexical; paraphrase gold
-                         # is usually vector-ONLY, so it must survive being a
-                         # single-signal item (see eval-history.jsonl v1-v3)
-VECTOR_MIN_COS = 0.50    # CALIBRATED PER MODEL (qwen3-embedding:0.6b): real
-                         # matches ~0.52-0.59, junk ~0.31-0.51. Re-measure with
-                         # eval_recall.py if the embed model changes (nomic ran
-                         # ~0.66+ real / ~0.59-0.67 junk — a 0.58 floor there)
+RRF_K = 60               # the reference scale: the first place of a list of weight w is worth w / (RRF_K + 1).
+                         # Also the fade of the graph list (the plain reciprocal-rank formula)
+LEXICAL_K = 1
+VECTOR_K = 10
+VECTOR_WEIGHT = 2.5
+VECTOR_MIN_COS = 0.45
 CONFIDENT_FUSED = 0.05   # eval metric: what counts as a "confident" fused top-1
 
 
-def _vector_list(query, top=50):
-    """Ranked [(store, ref)] by cosine, or None (Ollama/index absent = fail open)."""
+def _place_credit(weight, k, rank):
+    """What the record at 0-based `rank` of a list adds to its fused score.
+
+    A first place is worth weight / (RRF_K + 1) whatever k is; k sets how fast later places fade, and k = RRF_K is
+    the plain reciprocal-rank formula. Scores that include later places are lower than they were, so the reranker's
+    skip rule (RERANK_MIN_TOP1, RERANK_MIN_LEAD) and CONFIDENT_FUSED no longer fire on the same records: without
+    graph credit the bar is met only by a record first in both its keyword list and its vector list, and the lead is
+    met more often."""
+    if k == RRF_K:
+        return weight / (RRF_K + rank + 1)
+    return weight * (k + 1) / ((k + rank + 1) * (RRF_K + 1))
+
+
+def fuse(lists, canonical=None):
+    """Fused score per record from [(weight, k, [key, ...])], each list best first.
+
+    `canonical` maps a key to the record it stands for, or to None for a record that no longer exists; a list
+    credits each record once, at the first place that maps to it, and skipped entries still take up their places."""
+    fused = {}
+    for weight, k, keys in lists:
+        credited = set()
+        for rank, key in enumerate(keys):
+            if canonical is not None:
+                key = canonical(key)
+            if key is None or key in credited:
+                continue  # dead redirect / same canonical already credited by this list
+            credited.add(key)
+            fused[key] = fused.get(key, 0.0) + _place_credit(weight, k, rank)
+    return fused
+
+
+# Vector candidates per store (entries in each list). One list over every store let the largest store crowd
+# the rest out. Per-store lists preserve candidates from smaller stores, as the lexical side already does.
+VECTOR_STORE_TOP = {"file": 20, "hivemind": 20, "claudemem": 30}
+
+
+def _vector_lists(query, view=None):
+    """One ranked [(store, ref)] list per store by cosine, or None (Ollama/index absent = fail open).
+
+    Each store's ranking is read from the top until its list is full, the matches fall below VECTOR_MIN_COS, or
+    it runs out. On the way a superseded learning (store hm_redirect, or a hivemind row that expired after it
+    was embedded) is replaced by its active root at its own score, each record is kept once, and records the
+    view withholds are skipped: none of those uses up a place, however many there are."""
     try:
         import embed_index
-        ec = embed_index.connect()
-        hits = embed_index.search(ec, query, k=top)
-        ec.close()
-        if not hits:
+        if not os.path.isfile(embed_index.DB):
             return None
-        return [(s, str(r)) for s, r, score in hits if score >= VECTOR_MIN_COS]
+        ec = embed_index.connect()
+        try:
+            ranked = embed_index.ranked_by_store(ec, query, [*VECTOR_STORE_TOP, "hm_redirect"])
+        finally:
+            ec.close()
+        if not ranked:
+            return None
+
+        def tagged(store):
+            return ((store, str(ref), score) for ref, score in ranked[store])
+
+        sources = {store: tagged(store) for store in VECTOR_STORE_TOP}
+        sources["hivemind"] = heapq.merge(tagged("hivemind"), tagged("hm_redirect"), key=lambda hit: -hit[2])
+        redirect = view.hivemind_redirect if view is not None and view.store_available("hivemind") else {}
+
+        def canonical(store, ref):  # the same mapping fusion applies
+            if view is None:
+                return (store, ref)
+            if store == "hm_redirect":
+                return ("hivemind", redirect[ref]) if redirect.get(ref) else None
+            if store == "hivemind" and ref in redirect:
+                return ("hivemind", redirect[ref])
+            return (store, ref)
+
+        lists = []
+        for store, size in VECTOR_STORE_TOP.items():
+            kept, seen = [], set()
+            for s, r, score in sources[store]:
+                if score < VECTOR_MIN_COS:
+                    break  # best first: nothing after this can pass
+                key = canonical(s, r)
+                if key is None or key in seen:
+                    continue
+                seen.add(key)
+                if view is None or view.is_eligible(*key):
+                    kept.append(key)
+                    if len(kept) == size:
+                        break
+            if kept:
+                lists.append(kept)
+        return lists or None
     except Exception as e:
         sys.stderr.write(f"[vector skipped: {e}]\n")
         return None
 
 
-def _ppr_list(matched, top=100):
-    """Ranked [(store, ref)] by Personalized PageRank from resolved entities."""
+def _ppr_list(matched, top=100, view=None):
+    """Ranked [(store, ref)] by Personalized PageRank from resolved entities,
+    walked over the SAME eligibility view as every other signal."""
     try:
         import ppr
         seeds = {}
@@ -264,7 +465,7 @@ def _ppr_list(matched, top=100):
             eid = getattr(m, "entity_id", None)
             if eid is not None:
                 seeds[eid] = 1.0
-        hits = ppr.ranks(seeds, top=top)
+        hits = ppr.ranks(seeds, top=top, view=view)
         if not hits:
             return None
         return [(s, str(r)) for (s, r), _score in hits]
@@ -273,61 +474,108 @@ def _ppr_list(matched, top=100):
         return None
 
 
+def _load_view():
+    return graph_policy.load_view(None, graph_policy.Sources())
+
+
 def fused_search(query, k=25, use_vector=True, use_ppr=True, no_semantic=False,
-                 return_parts=False):
+                 return_parts=False, view=None):
     """RRF across per-store lexical lists + vector + PPR. Returns ranked
-    [(store, ref, fused_score)]; every ref is a str."""
+    [(store, ref, fused_score)]; every ref is a str.
+
+    One eligibility view governs every list. Graph signals (entity boosts,
+    PPR) are used only when the view is complete; the view is re-checked
+    before returning and a revision change drops the graph contribution and
+    re-fuses from the independently eligible lists (lexical + vector) under a
+    fresh view. `no_semantic` never disables exclusions.
+
+    The per-store searches are independent (each opens its own connections and
+    only reads), so they run at the same time; results are fused in the same
+    fixed order as before. Only one of them (the vector search) uses the
+    embedding service, so they do not compete for its single model slot."""
     tg = terms(query)
-    boosts, matched = ({}, [])
-    if sem is not None and not no_semantic:
+    graph_state = "ok"
+    if view is None:
         try:
-            boosts, matched = sem.recall_boosts(query)
-        except Exception as e:
-            sys.stderr.write(f"[semantic skipped: {e}]\n")
-    hm = hivemind(query, tg, boosts)
-    cm, cm_mode = claudemem(query, tg, boosts)
-    fl = files(query, tg, boosts)
-    lists = [
-        (1.0, [("hivemind", str(r[1])) for r in hm if r[6]]),  # grounded only
-        (1.0, [("claudemem", str(r[1])) for r in cm]),
-        (1.0, [("file", str(r[1])) for r in fl]),
-    ]
-    if use_vector:
-        v = _vector_list(query)
-        if v:
-            lists.append((VECTOR_WEIGHT, v))
-    if use_ppr and matched:
-        p = _ppr_list(matched)
-        if p:
-            lists.append((1.0, p))
-    # supersession mapping: vector hits on hm_redirect rows and any
-    # graph/lexical reference to an expired learning resolve to the active root
-    red = hm_redirects()
+            view = _load_view()
+        except graph_policy.GraphUnavailable as exc:
+            view = graph_policy.fallback_view(exc.reason)
+            graph_state = f"unavailable:{exc.reason}"
+    use_graph = sem is not None and not no_semantic and graph_state == "ok"
+    for attempt in range(2):
+        boosts, matched = ({}, [])
+        if use_graph:
+            try:
+                boosts, matched = sem.recall_boosts(query, view=view)
+            except Exception as e:
+                sys.stderr.write(f"[semantic skipped: {e}]\n")
+        import concurrent.futures as cf
+        with cf.ThreadPoolExecutor(max_workers=4, thread_name_prefix="recall-store") as pool:
+            hm_job = pool.submit(hivemind, query, tg, boosts, view=view)
+            cm_job = pool.submit(claudemem, query, tg, boosts, view=view)
+            fl_job = pool.submit(files, query, tg, boosts, view=view)
+            v_job = pool.submit(_vector_lists, query, view) if use_vector else None
+            hm = hm_job.result()
+            cm, cm_mode = cm_job.result()
+            fl = fl_job.result()
+            v = v_job.result() if v_job else None
+        lists = [
+            (1.0, LEXICAL_K, [("hivemind", str(r[1])) for r in hm if r[6]]),  # grounded only
+            (1.0, LEXICAL_K, [("claudemem", str(r[1])) for r in cm]),
+            (1.0, LEXICAL_K, [("file", str(r[1])) for r in fl]),
+        ]
+        for per_store in (v or []) if use_vector else []:
+            # vector-only hits obey the same view (hm_redirect rows are
+            # resolved to their active root by canonical() below)
+            lists.append((VECTOR_WEIGHT, VECTOR_K, [(s_, r_) for s_, r_ in per_store
+                                                    if s_ == "hm_redirect" or view.is_eligible(s_, r_)]))
+        if use_graph and use_ppr and matched:
+            p = _ppr_list(matched, view=view)
+            if p:
+                # the graph list keeps the plain formula (its places were not measured); beside the faded lists a
+                # deep graph place now counts for relatively more than a deep keyword or vector place
+                lists.append((1.0, RRF_K, p))
 
-    def canonical(key):
-        s, r = key
-        if s == "hm_redirect":
-            root = red.get(r)
-            return ("hivemind", root) if root else None
-        if s == "hivemind" and r in red:
-            return ("hivemind", red[r])
-        return key
+        # graph/lexical reference to an expired learning resolve to the active root
+        red = view.hivemind_redirect if view.store_available("hivemind") else {}
 
-    fused = {}
-    for weight, lst in lists:
-        seen_keys = set()
-        for rank, key in enumerate(lst):
-            key = canonical(key)
-            if key is None or key in seen_keys:
-                continue  # dead redirect / same canonical already credited by this list
-            seen_keys.add(key)
-            fused[key] = fused.get(key, 0.0) + weight / (RRF_K + rank + 1)
-    sup = {("claudemem", str(i)) for i in suppressed_obs_ids()}
-    ranked = sorted(((s, r, sc) for (s, r), sc in fused.items() if (s, r) not in sup),
-                    key=lambda x: -x[2])[:k]
+        def canonical(key):
+            s, r = key
+            if s == "hm_redirect":
+                root = red.get(r)
+                return ("hivemind", root) if root else None
+            if s == "hivemind" and r in red:
+                return ("hivemind", red[r])
+            return key
+
+        fused = fuse(lists, canonical)
+        ranked = sorted(((s, r, sc) for (s, r), sc in fused.items() if view.is_eligible(s, r)),
+                        key=lambda x: -x[2])[:k]
+        # recheck immediately before emitting: a policy/alias/control change
+        # since the view was built makes the graph contribution unusable
+        ok, why = graph_policy.recheck(view)
+        if ok or attempt == 1:
+            if not ok:
+                # the policy moved again during the rebuilt attempt: withhold
+                # claude-mem for this emit rather than trust a stale view, and
+                # let the printed eligibility summary say so
+                graph_state = f"unavailable:{why}"
+                ranked = [t for t in ranked if t[0] != "claudemem"]
+                cm, cm_mode = [], "unavailable"
+                import dataclasses as _dc
+                view = _dc.replace(view, stores={**view.stores,
+                                                 "claudemem": graph_policy.StoreState("unavailable", f"withheld:{why}")})
+            break
+        graph_state = f"unavailable:{why}"
+        use_graph = False
+        try:
+            view = _load_view()
+        except graph_policy.GraphUnavailable as exc:
+            view = graph_policy.fallback_view(exc.reason)
     if return_parts:
         return ranked, {"hm": hm, "cm": cm, "cm_mode": cm_mode, "fl": fl,
-                        "boosts": boosts, "matched": matched, "tg": tg}
+                        "boosts": boosts, "matched": matched, "tg": tg,
+                        "view": view, "graph_state": graph_state}
     return ranked
 
 
@@ -364,55 +612,11 @@ def _fused_labels(ranked, parts):
     return labels
 
 
-# query-keyword -> gbrain source id (isolated sources need explicit --source routing)
-GB_SOURCES = {
-    # OPTIONAL: map query keywords -> your local gbrain source ids, e.g.
-    # "myproject": "myproject-brain",
-}
-def _gbrain_bin():
-    return (shutil.which("gbrain") or
-            next((p for p in (os.path.expanduser("~/.bun/bin/gbrain"), "/opt/homebrew/bin/gbrain")
-                  if os.path.exists(p)), None))
-
-GB_LOCK_HELP = ("PGLite lock squatted (stale `gbrain serve`?) — recover: "
-                "pkill -f 'gbrain serve'; rm -f ~/.gbrain/.locks/*  "
-                "(a small watchdog cron that reaps orphans is worth setting up)")
-
-def gbrain(q, tg, slugs=()):
-    """Returns (hits_text_or_None, error_text_or_None).
-
-    Source routing now prefers entity slugs resolved by the semantic layer and
-    falls back to the legacy keyword map.
-    """
-    exe = _gbrain_bin()
-    if not exe: return None, None
-    srcs = ["gstack-brain"]
-    for key in list(slugs) + list(tg):
-        s = GB_SOURCES.get(key)
-        if s and s not in srcs:
-            srcs.append(s); break
-    hits, err = [], None
-    for src in srcs[:3]:
-        try:
-            r = subprocess.run([exe, "query", q, "--source", src],
-                               capture_output=True, text=True, timeout=35)
-            if "Timed out waiting for PGLite lock" in (r.stdout + r.stderr):
-                err = GB_LOCK_HELP
-                break  # lock is held — every remaining source would burn 30s the same way
-            for line in r.stdout.splitlines():
-                m = re.match(r"\s*\[([0-9.]+)\]\s+(\S+)\s+--\s+(.*)", line)
-                if m and not m.group(2).startswith("_archive/"):  # superseded memories stay out of recall
-                    hits.append((float(m.group(1)), src, m.group(2), m.group(3)[:90]))
-        except subprocess.TimeoutExpired:
-            err = "gbrain query hung >35s (lock squat or Ollama down?)"
-            break
-        except Exception:
-            continue
-    hits.sort(reverse=True)
-    if not hits: return None, err
-    return "\n".join(f" [{s:.2f}] ({src}) {path} — {title}" for s, src, path, title in hits[:6]), err
+# ---------------------------------------------------------------------------
 
 def bump_hm(ids):
+    if not ids or not os.path.isfile(HM):
+        return
     if not ids: return
     try:
         c = conn(HM); now = datetime.datetime.now().isoformat(timespec="seconds")
@@ -424,6 +628,8 @@ def bump_hm(ids):
         sys.stderr.write(f"[hm bump skipped: {e}]\n")
 
 def bump_cm(ids):
+    if not ids or not os.path.isfile(CM):
+        return
     if not ids: return
     try:
         c = conn(CM)
@@ -439,84 +645,39 @@ def main():
     ap.add_argument("query")
     ap.add_argument("--k", type=int, default=8)
     ap.add_argument("--no-bump", action="store_true")
-    ap.add_argument("--no-semantic", action="store_true", help="disable the entity layer (lexical only)")
-    ap.add_argument("--no-vector", action="store_true", help="disable the embedding signal")
-    ap.add_argument("--no-ppr", action="store_true", help="disable the PageRank signal")
+    ap.add_argument("--no-semantic", action="store_true")
+    ap.add_argument("--no-vector", action="store_true")
+    ap.add_argument("--no-ppr", action="store_true")
     a = ap.parse_args()
-    tg = terms(a.query)
-    if not tg:
-        print("no searchable terms"); return
-
+    if not terms(a.query):
+        print("no searchable terms")
+        return
     ranked, parts = fused_search(a.query, k=max(10, a.k), use_vector=not a.no_vector,
-                                 use_ppr=not a.no_ppr, no_semantic=a.no_semantic,
-                                 return_parts=True)
-    boosts, matched, cm_mode = parts["boosts"], parts["matched"], parts["cm_mode"]
-    hm = parts["hm"][:a.k]
-    cm = parts["cm"][:a.k]
-    fl = parts["fl"][:a.k]
-    gb, gb_err = gbrain(a.query, tg, [m.slug for m in matched])
-
-    def mark(p): return "🔒" if p else "  "
-    def via(entity_only): return "⊕" if entity_only else " "
-
-    print(f"=== mem_recall: {a.query!r}  (k={a.k}) ===")
-
-    if ranked:
-        labels = _fused_labels(ranked, parts)
-        print(f"\n— TOP ACROSS STORES (RRF: lexical+entity"
-              f"{'' if a.no_vector else '+vector'}{'' if a.no_ppr else '+ppr'}) —")
-        for s, r, sc in ranked:
-            prot, label = labels[(s, r)]
-            print(f" {mark(prot)}[{sc:.3f}] {s}:{r}  {label}")
-
-    if matched:
-        print(f"\n— ENTITIES ({len(matched)}) —")
-        for m in matched[:6]:
-            print(f" {mark(m.protected)}{m.kind:>9}: {m.name}")
-            if m.summary:
-                print(f"              {m.summary}")
-    elif sem is None:
-        print("\n— ENTITIES: semantic layer not installed (lexical only) —")
-    elif a.no_semantic:
-        print("\n— ENTITIES: disabled via --no-semantic —")
-    else:
-        print("\n— ENTITIES: query resolved to none (add aliases with sem.py alias) —")
-
-    print(f"\n— HIVEMIND learnings ({len(hm)}) —")
-    for s, rid, prot, cat, rule, eonly, _g in hm:
-        print(f" {mark(prot)}{via(eonly)}[{cat}] {rule}   (score {s:.1f}, id {rid})")
-    print(f"\n— CLAUDE-MEM observations ({len(cm)}, via {cm_mode}) —")
-    for s, oid, prot, title, eonly in cm:
-        print(f" {mark(prot)}{via(eonly)}{title}   (score {s:.1f}, obs {oid})")
-    print(f"\n— FILE memories ({len(fl)}) —")
-    for s, fn, prot, hits, eonly in fl:
-        print(f" {mark(prot)}{via(eonly)}{fn}   ({hits} hits)")
-
-    # Actual files on disk: the drafts, briefings, receipts and exports that
-    # memory used to describe but never point at.
-    arts = sorted(((w, ref) for (store, ref), w in boosts.items() if store == "artifact"),
-                  reverse=True)[:a.k]
-    if arts:
-        home = os.path.expanduser("~")
-        print(f"\n— ARTIFACTS on disk ({len(arts)}) —")
-        for w, ref in arts:
-            print(f"    [{w:.2f}] {ref.replace(home, '~')}")
-    if gb:
-        print(f"\n— GBRAIN semantic (hybrid query over project sources) —\n{gb}")
-    elif _gbrain_bin() is None:
-        print("\n— GBRAIN: CLI not installed —")
-    elif gb_err:
-        print(f"\n— ⚠ GBRAIN UNAVAILABLE: {gb_err} —")
-    else:
-        print("\n— GBRAIN: no semantic hits for this query —")
-
-    eonly_n = sum(1 for r in hm if r[5]) + sum(1 for r in cm if r[4]) + sum(1 for r in fl if r[4])
-    if eonly_n:
-        print(f"\n[⊕ = {eonly_n} record(s) retrieved by ENTITY with no keyword overlap]")
-
+                                 use_ppr=not a.no_ppr, no_semantic=a.no_semantic, return_parts=True)
+    labels = _fused_labels(ranked, parts)
+    stale = {}
+    try:
+        import mem_check
+        from contextlib import closing
+        ids = [ref for store, ref, _ in ranked[:a.k] if store == "hivemind"]
+        if ids:
+            with closing(sqlite3.connect(Path(HM).resolve().as_uri() + "?mode=ro", uri=True)) as check_conn:
+                stale = {str(key): value for key, value in mem_check.stale_map(check_conn, ids).items()}
+    except (OSError, sqlite3.Error, ValueError):
+        pass
+    print("=== memory recall ===")
+    for store, ref, score in ranked[:a.k]:
+        date = stale.get(str(ref)) if store == "hivemind" else None
+        if store == "file":
+            try:
+                date = mem_check.stale_note(os.path.join(MEMDIR, ref))
+            except (OSError, ValueError):
+                pass
+        note = f"  [unconfirmed since {date}]" if date else ""
+        print(f"[{score:.3f}] {store}:{ref}  {labels[(store, ref)][1]}{note}")
     if not a.no_bump:
-        bump_hm([r[1] for r in hm]); bump_cm([r[1] for r in cm])
-        print(f"[reinforced {len(hm)} learnings + {len(cm)} observations]")
+        bump_hm([r[1] for r in parts["hm"][:a.k]])
+        bump_cm([r[1] for r in parts["cm"][:a.k]])
 
 if __name__ == "__main__":
     main()

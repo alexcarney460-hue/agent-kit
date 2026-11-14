@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ppr — Personalized PageRank over the mention graph (HippoRAG-2 style).
+"""ppr — Personalized PageRank over the mention graph (local3367, HippoRAG 2).
 
 The semantic layer's one-hop entity boost with hub-exclusion + IDF was a
 hand-tuned approximation of what a graph walk does naturally: mass flowing from
@@ -9,38 +9,45 @@ iteration. ~19k mentions builds in ~50ms; the walk converges in <20 iterations.
 
 Used by mem_recall as one ranked signal into RRF — it does not replace the
 one-hop boosts, fusion arbitrates.
+
+Astra Batch 2: the walk consumes the SAME coherent eligibility view as every
+other reader (graph_policy.EligibilityView): excluded, inactive and missing
+records are removed BEFORE degrees are computed, owned automatic links join
+only in `active` mode, and there is no writable fallback. When a complete
+eligible view cannot be built, the signal is unavailable (None) — never a
+clipped graph.
 """
 from __future__ import annotations
 
 import os
-import sqlite3
+import memdir
 import sys
 
-SEM = os.path.expanduser("~/.claude/memory-tools/semantic.db")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import graph_policy  # noqa: E402
+
+SEM = memdir.semantic_db()
 DAMPING = 0.85
 ITERS = 25
 TOL = 1e-8
 
 
-def ranks(seed_entity_ids: dict[int, float], top: int = 200):
+def ranks(seed_entity_ids: dict[int, float], top: int = 200,
+          view: graph_policy.EligibilityView | None = None):
     """PPR scores for records given {entity_id: seed_weight}.
-    Returns ranked [((store, ref), score)] or None on any failure (fail open)."""
+    Returns ranked [((store, ref), score)] or None when the signal is
+    unavailable (no seeds, no eligible view, no numpy/scipy)."""
     if not seed_entity_ids:
         return None
     try:
         import numpy as np
         from scipy.sparse import csr_matrix
 
-        try:
-            conn = sqlite3.connect(f"file:{SEM}?mode=ro", uri=True, timeout=8)
-        except sqlite3.OperationalError:
-            # mode=ro fails on a WAL db with no -shm sidecar (routine here)
-            conn = sqlite3.connect(SEM, timeout=8)
-        rows = conn.execute(
-            "SELECT entity_id, store, ref, COALESCE(weight, 0.5) FROM mention "
-            "WHERE store IN ('hivemind','claudemem','file')").fetchall()
-        edges = conn.execute("SELECT src, dst FROM edge").fetchall()
-        conn.close()
+        if view is None:
+            view = graph_policy.load_view(None, graph_policy.Sources(sem_db=SEM))
+        rows = [(eid, store, ref, weight) for eid, store, ref, weight, _own in view.links
+                if store in graph_policy.GRAPH_STORES]
+        edges = [(s, d) for s, d, _rel in view.edges]
         if not rows:
             return None
 
@@ -87,6 +94,11 @@ def ranks(seed_entity_ids: dict[int, float], top: int = 200):
         rec_scores = [(k, float(p[ix])) for k, ix in rec_ix.items() if p[ix] > 0]
         rec_scores.sort(key=lambda kv: -kv[1])
         return rec_scores[:top]
+    except ImportError:
+        return None
+    except graph_policy.GraphUnavailable as exc:
+        sys.stderr.write(f"[ppr unavailable: {exc.reason}]\n")
+        return None
     except Exception as exc:
         sys.stderr.write(f"[ppr skipped: {exc}]\n")
         return None

@@ -18,11 +18,14 @@ import os
 import re
 import sqlite3
 import sys
+from contextlib import closing
+import memdir
+import sem
 
-SEM = os.path.expanduser("~/.claude/memory-tools/semantic.db")
-HM = os.path.expanduser("~/hivemind.db")
+SEM = memdir.semantic_db()
+HM = memdir.hivemind_db()
 CM = os.path.expanduser("~/.claude-mem/claude-mem.db")
-OUT = os.path.expanduser("~/.claude/memory-tools/sem-alias-candidates.md")
+OUT = os.path.join(memdir.tools_dir(), "sem-alias-candidates.md")
 
 N_HASH = 64
 SHINGLE = 3
@@ -62,7 +65,7 @@ def _est_jaccard(a: tuple, b: tuple) -> float:
 
 def main() -> int:
     try:
-        sem_conn = sqlite3.connect(SEM, timeout=8)
+        sem_conn = sem.connect()
         sem_conn.execute(
             "CREATE TABLE IF NOT EXISTS alias_proposal_seen ("
             " phrase TEXT PRIMARY KEY, decided TEXT, created_at TEXT)")
@@ -76,7 +79,9 @@ def main() -> int:
         known = {n.lower() for names in entities.values() for n in names}
     except Exception as exc:
         sys.stderr.write(f"[alias_propose] semantic layer unavailable: {exc}\n")
-        return 0
+        if 'sem_conn' in locals():
+            sem_conn.close()
+        return 1
 
     sigs = {slug: [_minhash(_shingles(n)) for n in names]
             for slug, names in entities.items()}
@@ -86,18 +91,22 @@ def main() -> int:
     lenient = lambda b: b.decode("utf-8", "replace") if isinstance(b, (bytes, bytearray)) else b
     try:
         from embed_index import open_ro
-        c = open_ro(HM); c.text_factory = lenient
-        texts += [r[0] for r in c.execute(
-            "SELECT rule || ' ' || COALESCE(context,'') FROM learnings "
-            "WHERE active=1 ORDER BY id DESC LIMIT 300")]
-        c.close()
-        c = open_ro(CM); c.text_factory = lenient
-        texts += [r[0] for r in c.execute(
-            "SELECT COALESCE(title,'') || ' ' || COALESCE(facts,'') FROM observations "
-            "ORDER BY id DESC LIMIT 600")]
-        c.close()
+        if os.path.exists(HM):
+            with closing(open_ro(HM)) as c:
+                c.text_factory = lenient
+                texts += [r[0] for r in c.execute(
+                    "SELECT rule || ' ' || COALESCE(context,'') FROM learnings "
+                    "WHERE active=1 ORDER BY id DESC LIMIT 300")]
+        if os.path.exists(CM):
+            with closing(open_ro(CM)) as c:
+                c.text_factory = lenient
+                texts += [r[0] for r in c.execute(
+                    "SELECT COALESCE(title,'') || ' ' || COALESCE(facts,'') FROM observations "
+                    "ORDER BY id DESC LIMIT 600")]
     except Exception as exc:
         sys.stderr.write(f"[alias_propose] store read failed: {exc}\n")
+        sem_conn.close()
+        return 1
 
     freq = {}
     for t in texts:
@@ -131,7 +140,7 @@ def main() -> int:
     sem_conn.close()
 
     if proposals:
-        with open(OUT, "a") as f:
+        with open(OUT, "a", encoding="utf-8") as f:
             f.write(f"\n## {now}\n")
             for phrase, slug, j, n in proposals:
                 f.write(f'- `sem.py alias {slug} "{phrase}"`  (minhash-jaccard {j}, seen {n}x)\n')

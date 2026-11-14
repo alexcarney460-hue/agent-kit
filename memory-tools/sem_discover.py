@@ -16,21 +16,31 @@ Two stages, because neither alone is enough:
 
 1. STATISTICS propose. The decisive feature is the capitalisation ratio — how
    often a string is capitalised when it appears at all. A proper noun is
-   essentially never written lowercase ("Contoso" ~1.0) while a common noun
+   essentially never written lowercase ("ExampleEntity" ~1.0) while a common noun
    capitalised at line starts is ("change", "page", "account" ~0.1). This
    calibrates itself; no hand-maintained word list can keep up. Mid-sentence
    capitalisation, record spread, multi-word shape and LLC/Inc/@ patterns refine
-   it. That still plateaus near 35% precision: every fix exposes another noise
+   it. Heuristics still have limited precision: every fix exposes another noise
    class — common nouns, then dates and timezones, then UI labels.
 
 2. A MODEL disposes. Judging whether a string names a real thing is what models
-   are good at. The classifier rejected PDT, UTC, Jul, July, URLs, DNs and
-   "Sent Items" while keeping "Riley Chen" and the Northwind Finance contact —
-   and it writes a factual one-line summary from the supplied context, which is
-   the part that makes an entity worth having.
+   are good at. The classifier can reject dates, time zones and interface labels
+   while retaining fictional entities such as SampleEntity. It writes a factual
+   one-line summary from the supplied context.
 
 Rejections are cached, so with nothing new to judge the model call is skipped
 entirely and a refresh costs nothing. Any classifier failure creates nothing.
+
+Compatibility guard: the provisional cap
+counts support from the DEDUPLICATED union of legacy `mention` rows and owned
+`graph_auto_mention` rows, and retires ONLY entities with no dependencies at
+all (no support of either kind, no alias beyond the one this program created,
+no relation) that are older than RETIRE_MIN_AGE_DAYS. Anything else is left
+pending and further admissions are HELD at the cap with a visible reason —
+ownership is never inferred and legacy rows are never retagged. The model
+corpus reader applies the same suppression overlay as recall; when the overlay
+is unavailable the claude-mem part of the corpus is withheld and reported.
+Classifier settings, source roots and the model prompt are unchanged.
 
 Usage: sem_discover.py [--dry-run] [--min-score N] [--max-new N] [--no-classify]
 """
@@ -42,20 +52,27 @@ import json
 import os
 import re
 import sqlite3
-import subprocess
+import model_cli
 import sys
 
+import datetime
+import sqlite3 as _sqlite3
+
+import graph_policy
+import memdir
+import graph_state
 import sem
 
-HM = os.path.expanduser("~/hivemind.db")
-CM = os.path.expanduser("~/.claude-mem/claude-mem.db")
-CANDIDATES = os.path.expanduser("~/.claude/memory-tools/sem-candidates.md")
+HM = graph_policy.HIVEMIND_DB
+CM = graph_policy.CLAUDEMEM_DB
+CANDIDATES = os.environ.get("SEM_CANDIDATES_PATH") or os.path.join(memdir.tools_dir(), "sem-candidates.md")
 
 AUTO_SOURCE = "auto-detected"
 AUTO_CONFIDENCE = 0.35          # keeps provisional entities below curated ones
 DEFAULT_MIN_SCORE = 6.0
 DEFAULT_MAX_NEW = 12            # per run, so a bad day cannot flood the layer
-MAX_PROVISIONAL = 60            # total cap; weakest are retired to make room
+MAX_PROVISIONAL = 60            # total cap; only dependency-free entities are retired to make room
+RETIRE_MIN_AGE_DAYS = 7         # a zero-support entity younger than this is still waiting for its links
 
 CAND_RE = re.compile(r"([A-Z][A-Za-z0-9]{2,}(?:[ ][A-Z][A-Za-z0-9]{2,}){0,2})")
 
@@ -81,29 +98,67 @@ NOISE = {
 
 
 def open_ro(path: str) -> sqlite3.Connection | None:
-    if not os.path.exists(path):
-        return None
+    """Ordinary read-only source connection; no writable fallback, bytes out."""
     try:
-        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
-    except sqlite3.OperationalError:
-        # mode=ro fails on a WAL db with no -shm sidecar (routine on WAL dbs)
-        c = sqlite3.connect(path, timeout=10)
-    c.text_factory = lambda b: b.decode("utf-8", "replace") if isinstance(b, (bytes, bytearray)) else b
-    return c
+        return graph_policy.open_ro(path)
+    except sqlite3.Error:
+        return None
+
+
+CORPUS_NOTES: list[str] = []
+
+
+def _dec(b) -> str | None:
+    """Strict decode; None for undecodable bytes (the row is skipped and counted)."""
+    try:
+        return graph_policy.utf8_strict(b)
+    except UnicodeDecodeError:
+        return None
 
 
 def corpus() -> list[str]:
+    """Model-phase input: active hivemind rules + the 4,000 most recent
+    observations MINUS the suppression overlay. Overlay unavailable => the
+    claude-mem part is withheld (not read) and reported."""
     out: list[str] = []
+    CORPUS_NOTES.clear()
+    skipped = 0
     hm = open_ro(HM)
     if hm:
-        out += [f"{r[0]} {r[1] or ''}" for r in
-                hm.execute("SELECT rule, context FROM learnings WHERE active=1")]
+        for rule, ctx in hm.execute("SELECT rule, context FROM learnings WHERE active=1"):
+            a, b = _dec(rule), _dec(ctx)
+            if a is None or b is None:
+                skipped += 1
+                continue
+            out.append(f"{a} {b}")
         hm.close()
-    cm = open_ro(CM)
+    else:
+        CORPUS_NOTES.append("hivemind unavailable")
+    try:
+        sconn = sem.connect_ro()
+        try:
+            suppressed = graph_policy.load_policy(sconn).suppressed
+        finally:
+            sconn.close()
+    except (sqlite3.Error, graph_policy.PolicyUnavailable) as exc:
+        CORPUS_NOTES.append(f"claude-mem withheld: suppression overlay unavailable ({getattr(exc, 'reason', type(exc).__name__)})")
+        suppressed = None
+    cm = open_ro(CM) if suppressed is not None else None
     if cm:
-        out += [f"{r[0] or ''}. {r[1] or ''} {r[2] or ''}" for r in cm.execute(
-            "SELECT title, text, facts FROM observations ORDER BY created_at_epoch DESC LIMIT 4000")]
+        for oid, title, text, facts in cm.execute(
+                "SELECT id, title, text, facts FROM observations ORDER BY created_at_epoch DESC LIMIT 4000"):
+            if oid in suppressed:
+                continue
+            t, x, f = _dec(title), _dec(text), _dec(facts)
+            if t is None or x is None or f is None:
+                skipped += 1
+                continue
+            out.append(f"{t}. {x} {f}")
         cm.close()
+    elif suppressed is not None:
+        CORPUS_NOTES.append("claude-mem unavailable")
+    if skipped:
+        CORPUS_NOTES.append(f"{skipped} undecodable row(s) skipped")
     return out
 
 
@@ -125,7 +180,7 @@ class Cand:
         """How often this string is capitalised when it appears at all.
 
         THE discriminating feature. A proper noun is essentially never written
-        lowercase — "Contoso" and "Northwind" sit at ~1.0. An ordinary noun that
+        lowercase — "ExampleEntity" and "SampleEntity" sit at ~1.0. An ordinary noun that
         merely gets capitalised at line starts — "change", "page", "account",
         "search" — sits far below, because prose is full of the lowercase form.
         No hand-maintained word list can keep up; this calibrates itself.
@@ -165,6 +220,7 @@ _CORPUS_CACHE: list[str] = []
 def discover(conn: sqlite3.Connection) -> list[Cand]:
     global _CORPUS_CACHE
     known_aliases = {a.lower() for (a,) in conn.execute("SELECT alias FROM alias")}
+    known_aliases.update(graph_policy.load_alias_map(conn).conflicts)
     known_words = set()
     for a in known_aliases:
         known_words.update(a.split())
@@ -233,7 +289,7 @@ def guess_kind(phrase: str) -> str:
 PROMPT = """You are curating the entity index of a personal memory system for a \
 software professional working across their projects and ventures. (EDIT this \
 description to match your world — e.g. "a founder running a logistics company \
-(Acme Logistics) with a finance partner (Northwind) and several side projects".)
+(Example Co) with an example project".)
 Below are strings extracted statistically from their notes. Decide for each whether it \
 names a REAL, SPECIFIC entity worth indexing — a person, company, product, system, \
 customer account, or document.
@@ -259,7 +315,7 @@ CANDIDATES:
 def classify(cands: list[Cand], timeout: int = 180) -> dict[str, dict]:
     """Ask a model which candidates are real. Returns {phrase_lower: decision}.
 
-    Heuristics get recall cheaply but plateau around 35% precision here — every
+    Heuristics get recall cheaply but have limited precision — every
     fix exposes another noise class (common nouns, then dates, then UI labels).
     Judging whether a string names a real thing is exactly what a model is good
     at, so the statistics propose and the model disposes.
@@ -267,21 +323,17 @@ def classify(cands: list[Cand], timeout: int = 180) -> dict[str, dict]:
     Any failure (no CLI, timeout, unparseable output) returns {} and the caller
     creates nothing. Degrading to "added no entities" is always safe.
     """
-    if not cands:
+    if not cands or not memdir.cloud_ok():
         return {}
     lines = []
     for i, c in enumerate(cands, 1):
         ctx = (c.example or "")[:260].replace("\n", " ")
         lines.append(f'{i}. "{c.phrase}" (seen in {len(c.records)} notes) — context: {ctx}')
-    try:
-        proc = subprocess.run(
-            ["claude", "-p", PROMPT % "\n".join(lines),
-             "--settings", '{"enabledPlugins":{"claude-mem@thedotmack":false}}'],
-            capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        sys.stderr.write(f"[sem_discover] classifier unavailable ({exc}); creating nothing\n")
+    raw = model_cli.run_model(PROMPT % "\n".join(lines), timeout)
+    if raw is None:
+        sys.stderr.write("[sem_discover] classifier unavailable; creating nothing\n")
         return {}
-    raw = proc.stdout.strip()
+    raw = raw.strip()
     m = re.search(r"\[.*\]", raw, re.S)
     if not m:
         sys.stderr.write("[sem_discover] classifier returned no JSON; creating nothing\n")
@@ -296,6 +348,69 @@ def classify(cands: list[Cand], timeout: int = 180) -> dict[str, dict]:
         if isinstance(d, dict) and isinstance(d.get("phrase"), str):
             out[d["phrase"].strip().lower()] = d
     return out
+
+
+# --------------------------------------------------------------------------- #
+# provisional cap: deduplicated support, explicit dependency enumeration
+# --------------------------------------------------------------------------- #
+def provisional_dependencies(conn: sqlite3.Connection) -> list[dict]:
+    """Every provisional entity with its dependencies enumerated. Support is the
+    deduplicated union of legacy and owned (store, ref) links; ownership of
+    legacy rows is NOT inferred."""
+    owned = graph_state.owned_support(conn)
+    out = []
+    for eid, slug, name, created in conn.execute(
+            "SELECT id, slug, name, created_at FROM entity WHERE source=? ORDER BY id", (AUTO_SOURCE,)):
+        legacy = {(s, r) for s, r in conn.execute("SELECT store, ref FROM mention WHERE entity_id=?", (eid,))}
+        own = owned.get(eid, set())
+        aliases = {a for (a,) in conn.execute("SELECT alias FROM alias WHERE entity_id=?", (eid,))}
+        edges = conn.execute("SELECT count(*) FROM edge WHERE src=? OR dst=?", (eid, eid)).fetchone()[0]
+        out.append({"id": eid, "slug": slug, "name": name, "created_at": created or "",
+                    "legacy": len(legacy), "owned": len(own), "support": len(legacy | own),
+                    "extra_aliases": sorted(aliases - {name.strip().lower()}), "edges": edges})
+    return out
+
+
+def _age_days(created: str) -> float:
+    try:
+        return (datetime.datetime.now() - datetime.datetime.fromisoformat(created[:19])).total_seconds() / 86400
+    except ValueError:
+        return 0.0
+
+
+def safe_to_retire(dep: dict) -> bool:
+    """Only an entity with NO dependencies of any kind may be retired automatically."""
+    return (dep["support"] == 0 and not dep["extra_aliases"] and dep["edges"] == 0
+            and _age_days(dep["created_at"]) >= RETIRE_MIN_AGE_DAYS)
+
+
+def pending_reason(dep: dict) -> str:
+    parts = []
+    if dep["legacy"]:
+        parts.append(f"legacy/unclassified links {dep['legacy']}")
+    if dep["owned"]:
+        parts.append(f"owned links {dep['owned']}")
+    if dep["extra_aliases"]:
+        parts.append(f"manual aliases {len(dep['extra_aliases'])}")
+    if dep["edges"]:
+        parts.append(f"relations {dep['edges']}")
+    if not parts:
+        parts.append(f"younger than {RETIRE_MIN_AGE_DAYS}d")
+    return ", ".join(parts)
+
+
+def retire(conn: sqlite3.Connection, deps: list[dict]) -> list[str]:
+    """Delete dependency-free provisional entities. graph_auto_mention has ON
+    DELETE RESTRICT, so a race that adds owned support makes the delete fail
+    visibly instead of cascading."""
+    gone = []
+    for d in deps:
+        try:
+            conn.execute("DELETE FROM entity WHERE id=?", (d["id"],))
+            gone.append(d["slug"])
+        except _sqlite3.IntegrityError:
+            sys.stderr.write(f"[sem_discover] retirement of {d['slug']} refused: owned support appeared\n")
+    return gone
 
 
 def main() -> None:
@@ -319,9 +434,24 @@ def main() -> None:
                                   (slugify(c.phrase),)).fetchone()]
     if not fresh:
         print("no new candidates — skipping the classifier")
+        for note in CORPUS_NOTES:
+            print(f"corpus: {note}")
         conn.close()
         return
-    decisions = {} if a.no_classify else classify(fresh)
+    # Admission at the cap: room = cap - current provisional count; only
+    # dependency-free entities can be retired to make more room. Candidates
+    # beyond that are HELD (not classified, not cached as rejected).
+    deps = provisional_dependencies(conn)
+    safe = sorted([d for d in deps if safe_to_retire(d)], key=lambda d: d["created_at"])
+    unsafe = [d for d in deps if not safe_to_retire(d)]
+    room = MAX_PROVISIONAL - len(deps)
+    admissible = max(0, room + len(safe))
+    held = fresh[admissible:]
+    fresh = fresh[:admissible]
+    skip_model = a.no_classify or a.dry_run or not memdir.cloud_ok()
+    if skip_model:
+        print(f"classifier skipped: {len(fresh)} candidates")
+    decisions = {} if (skip_model or not fresh) else classify(fresh)
     created, rejected = [], []
     for c in fresh:
         slug = slugify(c.phrase)
@@ -350,16 +480,16 @@ def main() -> None:
             sem.add_alias(conn, eid, c.phrase)
         created.append((c, slug, kind, summary))
 
-    # Cap provisional entities so auto-detection can never dominate the layer.
+    # Cap provisional entities so auto-detection can never dominate the layer —
+    # by retiring ONLY dependency-free entities, as many as the kept creations
+    # need. Entities with any legacy/owned/manual dependency stay (pending).
     retired = 0
+    retired_slugs: list[str] = []
     if not a.dry_run:
-        prov = conn.execute(
-            "SELECT e.id, e.slug, COUNT(m.id) c FROM entity e "
-            "LEFT JOIN mention m ON m.entity_id=e.id WHERE e.source=? "
-            "GROUP BY e.id ORDER BY c DESC", (AUTO_SOURCE,)).fetchall()
-        for eid, slug, _c in prov[MAX_PROVISIONAL:]:
-            conn.execute("DELETE FROM entity WHERE id=?", (eid,))
-            retired += 1
+        need = max(0, len(deps) + len(created) - MAX_PROVISIONAL)   # creations above happened in this transaction
+        if need:
+            retired_slugs = retire(conn, safe[:need])
+            retired = len(retired_slugs)
         conn.commit()
 
     print(f"scanned {len(ranked)} candidates")
@@ -370,7 +500,15 @@ def main() -> None:
         print(f"classifier rejected {len(rejected)}: "
               f"{', '.join(c.phrase for c in rejected[:12])}")
     if retired:
-        print(f"retired {retired} provisional entities over the cap of {MAX_PROVISIONAL}")
+        print(f"retired {retired} dependency-free provisional entities over the cap of {MAX_PROVISIONAL}: "
+              f"{', '.join(retired_slugs)}")
+    if held:
+        print(f"HELD {len(held)} candidate(s) at the provisional cap ({len(deps)}/{MAX_PROVISIONAL}, "
+              f"{len(unsafe)} not safely retirable): {', '.join(c.phrase for c in held[:12])}")
+        for d in unsafe[:12]:
+            print(f"  pending retirement {d['slug']}: {pending_reason(d)}")
+    for note in CORPUS_NOTES:
+        print(f"corpus: {note}")
 
     if not a.dry_run:
         with open(CANDIDATES, "w", encoding="utf-8") as fh:

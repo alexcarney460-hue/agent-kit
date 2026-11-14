@@ -27,19 +27,18 @@ import os
 import random
 import re
 import sqlite3
-import subprocess
+import model_cli
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from memdir import memory_dir  # noqa: E402
+import memdir
+from pathlib import Path
 
-HM = os.path.expanduser("~/hivemind.db")
-CM = os.path.expanduser("~/.claude-mem/claude-mem.db")
-MEMDIR = memory_dir()
-QFILE = os.path.expanduser("~/.claude/memory-tools/eval-questions.json")
-HIST = os.path.expanduser("~/.claude/memory-tools/eval-history.jsonl")
-CLAUDE_BIN = (__import__("shutil").which("claude")
-              or os.path.expanduser("~/.local/bin/claude"))
+HM = memdir.hivemind_db()
+CM = os.path.join(memdir.home(), ".claude-mem", "claude-mem.db")
+MEMDIR = memdir.memory_dir()
+QFILE = os.path.join(memdir.tools_dir(), "eval-questions.json")
+HIST = os.path.join(memdir.tools_dir(), "eval-history.jsonl")
 
 GEN_PROMPT = """You are building a retrieval benchmark. For EACH record below, write ONE question that this record (and ideally only it) answers. Alternate style: even-numbered records get a natural DIRECT question; odd-numbered get a PARAPHRASE question that shares AS FEW content words with the record as possible (use synonyms, role descriptions instead of names, etc.).
 
@@ -64,45 +63,46 @@ def lenient(conn):
 
 
 def sample_records(n_hm=18, n_cm=14, n_file=8, n_sup=5, seed=3367):
+    from contextlib import closing
     rng = random.Random(seed)
     out = []
-    c = lenient(sqlite3.connect(f"file:{HM}?mode=ro", uri=True))
-    rows = c.execute("SELECT id, rule, COALESCE(context,'') FROM learnings "
-                     "WHERE active=1 AND rule NOT LIKE 'kimi-auto:%' AND length(rule) > 60").fetchall()
-    for rid, rule, ctx in rng.sample(rows, min(n_hm, len(rows))):
-        out.append({"store": "hivemind", "ref": str(rid), "text": f"{rule} {ctx}"[:600]})
-    # superseded: gold = canonical, question written from the EXPIRED text
-    sup = c.execute(
-        "SELECT l.rule, l.superseded_by, c.rule FROM learnings l JOIN learnings c ON c.id=l.superseded_by "
-        "WHERE l.superseded_by IS NOT NULL AND c.active=1").fetchall()
-    for old_rule, canon_id, canon_rule in rng.sample(sup, min(n_sup, len(sup))):
-        out.append({"store": "hivemind", "ref": str(canon_id),
-                    "text": old_rule[:600], "kind_override": "superseded"})
-    c.close()
-    c = lenient(sqlite3.connect(f"file:{CM}?mode=ro", uri=True))
-    rows = c.execute("SELECT id, title, COALESCE(facts, SUBSTR(COALESCE(text,''),1,400)) "
-                     "FROM observations WHERE length(COALESCE(title,'')) > 25").fetchall()
-    for oid, title, facts in rng.sample(rows, min(n_cm, len(rows))):
-        out.append({"store": "claudemem", "ref": str(oid), "text": f"{title} {facts}"[:600]})
-    c.close()
-    files = [f for f in os.listdir(MEMDIR) if f.endswith(".md") and f != "MEMORY.md"]
+    if os.path.isfile(HM):
+        with closing(lenient(sqlite3.connect(Path(HM).resolve().as_uri() + "?mode=ro", uri=True))) as c:
+            rows = c.execute("SELECT id, rule, COALESCE(context,'') FROM learnings "
+                             "WHERE active=1 AND length(rule) > 60").fetchall()
+            for rid, rule, ctx in rng.sample(rows, min(n_hm, len(rows))):
+                out.append({"store": "hivemind", "ref": str(rid), "text": f"{rule} {ctx}"[:600]})
+            rows = c.execute("SELECT l.rule, l.superseded_by FROM learnings l "
+                             "JOIN learnings c ON c.id=l.superseded_by "
+                             "WHERE l.superseded_by IS NOT NULL AND c.active=1").fetchall()
+            for rule, canon_id in rng.sample(rows, min(n_sup, len(rows))):
+                out.append({"store": "hivemind", "ref": str(canon_id),
+                            "text": rule[:600], "kind_override": "superseded"})
+    if os.path.isfile(CM):
+        with closing(lenient(sqlite3.connect(Path(CM).resolve().as_uri() + "?mode=ro", uri=True))) as c:
+            rows = c.execute("SELECT id, title, COALESCE(facts, SUBSTR(COALESCE(text,''),1,400)) "
+                             "FROM observations WHERE length(COALESCE(title,'')) > 25").fetchall()
+            for oid, title, facts in rng.sample(rows, min(n_cm, len(rows))):
+                out.append({"store": "claudemem", "ref": str(oid), "text": f"{title} {facts}"[:600]})
+    files = [f for f in os.listdir(MEMDIR) if f.endswith(".md") and f != "MEMORY.md"] if os.path.isdir(MEMDIR) else []
     for fn in rng.sample(files, min(n_file, len(files))):
-        text = open(os.path.join(MEMDIR, fn), encoding="utf-8", errors="replace").read()
+        text = Path(MEMDIR, fn).read_text(encoding="utf-8", errors="replace")
         out.append({"store": "file", "ref": fn, "text": text[:600]})
     return out
 
 
 def generate(seed=3367, qfile=QFILE):
+    if not memdir.cloud_ok():
+        print("Question generation requires cloud opt-in.")
+        return
     records = sample_records(seed=seed)
     questions = []
     for i in range(0, len(records), 15):
         batch = records[i:i + 15]
         lines = "\n".join(f"{j + 1}. [{r['store']}:{r['ref']}] {r['text'][:400]}"
                           for j, r in enumerate(batch))
-        proc = subprocess.run([CLAUDE_BIN, "-p", GEN_PROMPT % lines, "--settings",
-                               '{"enabledPlugins":{"claude-mem@thedotmack":false}}'],
-                              capture_output=True, text=True, timeout=300)
-        m = re.search(r"\[.*\]", proc.stdout, re.S)
+        output = model_cli.run_model(GEN_PROMPT % lines, 300)
+        m = re.search(r"\[.*\]", output or "", re.S)
         if not m:
             sys.stderr.write(f"[gen] batch {i // 15} returned no JSON — skipped\n")
             continue
@@ -123,7 +123,7 @@ def generate(seed=3367, qfile=QFILE):
     for q in ABSTENTION:
         questions.append({"question": q, "gold": [], "kind": "abstention"})
     questions = [q for q in questions if q["question"]]
-    with open(qfile, "w") as f:
+    with open(qfile, "w", encoding="utf-8") as f:
         json.dump(questions, f, indent=1)
     kinds = {}
     for q in questions:
@@ -136,7 +136,7 @@ def run(label: str, use_vector: bool, use_ppr: bool, k: int = 5, qfile: str = QF
     scored = {"direct": [], "paraphrase": [], "superseded": []}
     false_conf = 0
     abst_n = 0
-    questions = json.load(open(qfile))
+    questions = json.load(open(qfile, encoding="utf-8"))
     for q in questions:
         ranked = mem_recall.fused_search(q["question"], k=25,
                                          use_vector=use_vector, use_ppr=use_ppr)
@@ -161,7 +161,7 @@ def run(label: str, use_vector: bool, use_ppr: bool, k: int = 5, qfile: str = QF
     result[f"recall@{k}_all"] = round(sum(1 for r in all_ranks if r) / max(1, len(all_ranks)), 3)
     result["mrr"] = round(sum(1 / r for r in all_ranks if r) / max(1, len(all_ranks)), 3)
     result["false_confidence"] = round(false_conf / max(1, abst_n), 3)
-    with open(HIST, "a") as f:
+    with open(HIST, "a", encoding="utf-8") as f:
         f.write(json.dumps(result) + "\n")
     print(json.dumps(result, indent=1))
 
@@ -169,6 +169,7 @@ def run(label: str, use_vector: bool, use_ppr: bool, k: int = 5, qfile: str = QF
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--generate", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--run", action="store_true")
     ap.add_argument("--label", default="unlabeled")
     ap.add_argument("--no-vector", action="store_true")
@@ -176,6 +177,9 @@ def main():
     ap.add_argument("--seed", type=int, default=3367)
     ap.add_argument("--qfile", default=QFILE)
     a = ap.parse_args()
+    if a.dry_run:
+        print("Dry run: no evaluation or model calls made.")
+        return
     if a.generate:
         generate(seed=a.seed, qfile=a.qfile)
     if a.run:

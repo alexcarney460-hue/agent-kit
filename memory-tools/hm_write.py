@@ -16,9 +16,19 @@ Usage:
 """
 from __future__ import annotations
 import argparse, os, sqlite3, sys, time, datetime, random, re
+import memdir
+import mem_gate
 
-DB = os.path.expanduser("~/hivemind.db")
-PROTECT_RE = re.compile(r"client-a|project-b|partner-name", re.I)  # EDIT: keywords whose memories get pinned/protected — your ventures, clients, partners
+DB = memdir.hivemind_db()
+
+def is_protected(text):
+    import json
+    try:
+        with open(os.path.join(memdir.tools_dir(), "protected-topics.json"), encoding="utf-8") as f:
+            items = json.load(f)
+        return isinstance(items, list) and any(isinstance(v, str) and v.strip() and v.lower() in text.lower() for v in items)
+    except (OSError, ValueError):
+        return False
 
 def connect():
     conn = sqlite3.connect(DB, timeout=10)
@@ -49,10 +59,17 @@ def main():
                     help="entity slug to link (repeatable); auto-detected too")
     ap.add_argument("--no-adjudicate", action="store_true",
                     help="skip the write-time LLM neighbor adjudication")
+    ap.add_argument("--force", action="store_true")
     a = ap.parse_args()
+    if not a.force:
+        gate = mem_gate.scan(a.rule, a.context or "")
+        if gate.verdict == "quarantine":
+            qid = mem_gate.quarantine_insert(a.category, a.rule, a.context, gate.findings)
+            print(f"QUARANTINED id={qid}")
+            return
 
     blob = f"{a.rule} {a.context or ''}"
-    protected = 1 if PROTECT_RE.search(blob) else 0
+    protected = 1 if is_protected(blob) else 0
     now = datetime.datetime.now().isoformat(timespec="seconds")
     src = f"{a.source_session}@{a.device}"
 
@@ -73,7 +90,7 @@ def main():
                 sys.stderr.write(f"[hm_write WARN] near-neighbor learning {rid}: {r[:80]!r}\n")
 
     verdict = None
-    if neighbors and os.environ.get("HM_ADJUDICATE") == "1" and not a.no_adjudicate and not os.environ.get("HM_NO_LLM"):
+    if neighbors and memdir.cloud_ok() and not a.no_adjudicate and not os.environ.get("HM_NO_LLM"):
         verdict = adjudicate(a.rule, a.context, neighbors[:3])
 
     if verdict and verdict.get("verdict") == "DUPLICATE" and verdict.get("target") in {n[0] for n in neighbors}:
@@ -151,17 +168,16 @@ DUPLICATE = same fact, nothing new. SUPERSEDES = new one replaces/corrects the n
 
 def adjudicate(rule: str, context: str | None, neighbors: list) -> dict | None:
     """Write-time Mem0-style adjudication. Any failure returns None (= plain ADD)."""
+    if not memdir.cloud_ok():
+        return None
     import json as _json
-    import subprocess
+    import model_cli
     lines = "\n".join(f"id={rid}: {(r or '')[:200]} | {(c or '')[:150]}" for rid, r, c, _ in neighbors)
     try:
-        proc = subprocess.run(
-            ["claude", "-p", ADJUDICATE_PROMPT % (rule[:400], (context or "")[:300], lines),
-             "--settings", '{"enabledPlugins":{"claude-mem@thedotmack":false}}'],
-            capture_output=True, text=True, timeout=45)
-        m = re.search(r"\{.*\}", proc.stdout, re.S)
+        output = model_cli.run_model(ADJUDICATE_PROMPT % (rule[:400], (context or "")[:300], lines), 45)
+        m = re.search(r"\{.*\}", output or "", re.S)
         v = _json.loads(m.group(0)) if m else None
-        if v and v.get("verdict") in ("NEW", "DUPLICATE", "SUPERSEDES", "CONTRADICTS"):
+        if isinstance(v, dict) and v.get("verdict") in ("NEW", "DUPLICATE", "SUPERSEDES", "CONTRADICTS"):
             sys.stderr.write(f"[hm_write adjudicate] {v['verdict']} target={v.get('target')} ({v.get('reason','')})\n")
             return v
     except Exception as exc:
@@ -171,6 +187,8 @@ def adjudicate(rule: str, context: str | None, neighbors: list) -> dict | None:
 
 def link_entities(rid: int, blob: str, explicit: list[str]) -> list[str]:
     """Attach mentions for this learning. Returns the entity slugs linked."""
+    if os.environ.get("HM_NO_SEM"):
+        return []
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import sem

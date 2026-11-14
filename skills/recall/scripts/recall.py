@@ -15,7 +15,10 @@ from pathlib import Path
 
 CLAUDE_DIR = Path.home() / ".claude"
 CODEX_DIR = Path.home() / ".codex"
-DB_PATH = Path.home() / ".recall.db"
+sys.path.insert(0, str(CLAUDE_DIR / "memory-tools"))
+from memdir import memory_dir
+
+DB_PATH = Path(memory_dir()) / "session-recall.db"
 CLAUDE_PROJECTS_DIR = CLAUDE_DIR / "projects"
 CODEX_SESSIONS_DIR = CODEX_DIR / "sessions"
 
@@ -74,18 +77,6 @@ def migrate_schema(conn):
         conn.execute("ALTER TABLE sessions ADD COLUMN file_path TEXT DEFAULT ''")
         conn.commit()
 
-
-
-def migrate_db_location():
-    """Move recall.db from ~/.claude/ to ~/ if it exists at the old path."""
-    old_path = CLAUDE_DIR / "recall.db"
-    if old_path.exists() and not DB_PATH.exists():
-        old_path.rename(DB_PATH)
-        # Also move the WAL/SHM files if they exist
-        for suffix in ("-wal", "-shm"):
-            old_extra = Path(str(old_path) + suffix)
-            if old_extra.exists():
-                old_extra.rename(Path(str(DB_PATH) + suffix))
 
 
 TEXT_BLOCK_TYPES = {"text", "input_text", "output_text"}
@@ -597,7 +588,7 @@ def main():
 
     args = parser.parse_args()
 
-    migrate_db_location()
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     new_db = not DB_PATH.exists()
     old_umask = os.umask(0o077)
     conn = sqlite3.connect(str(DB_PATH))

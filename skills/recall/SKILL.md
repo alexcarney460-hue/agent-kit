@@ -1,90 +1,32 @@
 ---
 name: recall
-description: >
-  Search past Claude Code and Codex sessions. Triggers: /recall, "search old conversations",
-  "find a past session", "recall a previous conversation", "search session history",
-  "what did we discuss", "remember when we"
+description: Search durable memory and past Claude Code and Codex sessions.
 metadata:
   author: arjunkmrm
   version: "0.3.0"
   license: MIT
 ---
 
-# /recall — Search Past Claude & Codex Sessions
+# Recall
 
-Search all past Claude Code and Codex sessions using full-text search with BM25 ranking.
+Use the Python that installed the kit (`python`, `py -3` or `python3`); in the examples below, substitute that interpreter for `python` if necessary. These commands use `$HOME` in both bash and PowerShell.
 
-## Usage
-
-```bash
-python3 "$HOME/.agents/skills/recall/scripts/recall.py" QUERY [--project PATH] [--days N] [--source claude|codex] [--limit N] [--reindex]
-```
-
-## Examples
+The shared file-memory directory is printed by:
 
 ```bash
-# Simple keyword search
-python3 "$HOME/.agents/skills/recall/scripts/recall.py" "bufferStore"
-
-# Phrase search (exact match)
-python3 "$HOME/.agents/skills/recall/scripts/recall.py" '"ACP protocol"'
-
-# Boolean query
-python3 "$HOME/.agents/skills/recall/scripts/recall.py" "rust AND async"
-
-# Prefix search
-python3 "$HOME/.agents/skills/recall/scripts/recall.py" "buffer*"
-
-# Filter by project and recency
-python3 "$HOME/.agents/skills/recall/scripts/recall.py" "state machine" --project ~/my-project --days 7
-
-# Search only Claude Code sessions
-python3 "$HOME/.agents/skills/recall/scripts/recall.py" "buffer" --source claude
-
-# Search only Codex sessions
-python3 "$HOME/.agents/skills/recall/scripts/recall.py" "buffer" --source codex
-
-# Force reindex
-python3 "$HOME/.agents/skills/recall/scripts/recall.py" --reindex "test"
+python -c "import sys, os; sys.path.insert(0, os.path.join(os.path.expanduser(chr(126)), '.claude', 'memory-tools')); import memdir; print(memdir.memory_dir())"
 ```
 
-## Query Syntax (FTS5)
-
-- **Words**: `bufferStore` — matches stemmed variants (e.g., "discussing" matches "discuss")
-- **Phrases**: `"ACP protocol"` — exact phrase match
-- **Boolean**: `rust AND async`, `tauri OR electron`, `NOT deprecated`
-- **Prefix**: `buffer*` — matches bufferStore, bufferMap, etc.
-- **Combined**: `"state machine" AND test`
-- **CJK**: `issue化` — automatically uses trigram matching for Japanese/Chinese/Korean text
-
-## After Finding a Match
-
-To resume a session, `cd` into the project directory and use the appropriate command:
+Search the installed unified memory tools:
 
 ```bash
-# Claude Code sessions [claude]
-cd /path/to/project
-claude --resume SESSION_ID
-
-# Codex sessions [codex]
-cd /path/to/project
-codex resume SESSION_ID
+python "$HOME/.claude/memory-tools/mem_recall.py" "your query"
 ```
 
-Each result includes a `File:` path. Use it to read the raw transcript (auto-detects format):
+To search past sessions, locate the directory containing this skill's `SKILL.md` as supplied by the active agent, then substitute its actual path for `SKILL_DIRECTORY`:
 
 ```bash
-python3 "$HOME/.agents/skills/recall/scripts/read_session.py" <File-path-from-result>
+python "SKILL_DIRECTORY/scripts/recall.py" "your query"
 ```
 
-If results are missing `File:` paths, run `--reindex` to backfill.
-
-## Notes
-
-- Index is stored at `~/.recall.db` (SQLite FTS5, auto-migrated from `~/.claude/recall.db`)
-- Indexes both `~/.claude/projects/` (Claude Code) and `~/.codex/sessions/` (Codex)
-- First run indexes all sessions (a few seconds); subsequent runs are incremental
-- Only user and assistant messages are indexed (tool calls, thinking blocks, state snapshots skipped)
-- Results show `[claude]` or `[codex]` tags to indicate the source
-- Dual-table FTS: English queries use Porter stemming, CJK queries use trigram matching
-- **Upgrading from 0.2.x**: run `--reindex` once to build the CJK index
+The session index is `session-recall.db` inside the shared file-memory directory. It searches local Claude Code and Codex transcripts; it does not upload them. Options include `--project PATH`, `--days N`, `--source claude|codex`, `--limit N` and `--reindex`. Supports FTS5 phrases, AND, OR, NOT, and prefix searches. To inspect a result, run `python "SKILL_DIRECTORY/scripts/read_session.py" "FILE_PATH"` with the result's path. Creating a new index does not migrate or delete legacy indexes; it rebuilds from local transcripts.

@@ -1,29 +1,13 @@
-# agent-kit v3
+# agent-kit v4
 
-The portable core of Alex's AI agent setup, packaged for the Codex CLI: a memory that
-persists between sessions, working rules, and about 40 skills. It ships empty: tools,
-schemas and instructions only, with no memory data and no credentials.
+A portable memory, rules and skills kit for Claude Code and Codex. The kit contains no prior memory or credentials. Follow [INSTALL-FOR-AGENT.md](INSTALL-FOR-AGENT.md) to install it.
 
-**Agents doing the install: follow [INSTALL-FOR-AGENT.md](INSTALL-FOR-AGENT.md).**
+`python install.py` installs both hosts; `--host claude` or `--host codex` selects one. The existing update command, `python install_codex.py`, also installs both. Use `--dry-run` to preview, `--home PATH` for a test home, and `--no-smoke` to skip the memory smoke test. Files and instruction blocks the owner edited are kept and reported; replaced or retired unchanged kit files are backed up in `~/agent-kit-backup-<run id>/`. The install report identifies the backup and any failures.
 
-## What's inside
+The kit installs shared memory tools and rules under `~/.claude/`, skills under `~/.claude/skills/` and `~/.agents/skills/`, Claude agents, commands and a session-end hook, and managed instruction blocks for each host. It does not install software or plugins, register jobs, or change host permissions or login settings. `python check_install.py` writes a shareable inventory report in the home folder: versions, counts, and the names of files the kit itself installed; anything else is only counted. To report versions it runs `claude`, `codex`, `git`, `node` and `bun` with `--version`; those programs may write housekeeping files in their own folders.
 
-| Folder / file | What it is |
-|---|---|
-| `install_codex.py` | Cross-platform installer (Windows, macOS, Linux, WSL). Idempotent, keeps your edits, backs up anything it replaces. `--dry-run` shows the plan. |
-| `AGENTS.codex.md` | Global instructions for Codex, rendered into `~/.codex/AGENTS.md` with this machine's paths. |
-| `memory-tools/` | `hm_write.py` (apostrophe-safe memory writer), `mem_recall.py` (hybrid recall: keyword, reinforcement, semantic entities, optional vectors and graph ranking), `sem*.py` (entity and alias layer), `consolidate.py` (merge and distil), tests, schemas. |
-| `rules/` | Operating mode, the 13 production layers, coding style, testing, security, git workflow, agent orchestration, Python and TypeScript rules. |
-| `skills/` | Design, debugging, TDD, planning, code review, adversarial review, blast radius, benchmarking, Next.js/React/TypeScript/Python, recall, remember, handoff, promptify, writing skills, and more. |
+Memory stays on this computer by default. `AGENT_KIT_CLOUD=1` is the only switch that lets memory text be handed to a model command line program; nothing else turns it on (the older `HM_ADJUDICATE` variable no longer allows anything), and a dry run never sends. With the switch on, these send the memories they are working on to the Claude command line program under the owner's own account: `hm_write.py` (deciding whether a new memory duplicates an old one), `sem_discover.py` (classifying new names), `consolidate.py` (merging, distilling, and the contradiction check that `mem_check.py` prepares for it), and `eval_recall.py` (writing evaluation questions). `embed_index.py` sends text only to an embedding server running on this same computer and refuses any other address; with the switch on and an embedding index built, `mem_recall.py` also sends each search query to that same local server. The scheduled consolidation and semantic refresh jobs follow the same switch. Separately from all of this, whatever an agent recalls from memory during a session becomes part of that conversation, and so goes to the company whose agent it is (Anthropic for Claude Code, OpenAI for Codex), like anything else the agent reads. The semantic refresh (run by hand or as a scheduled job) also looks for documents it can link to the people and projects recorded in the memory: it lists files on the Desktop and notes (`.md`, `.txt`) under `~/workspace`, two levels deep, and reads text files there to match names. It skips anything with a credential-style word in its path (key, password, secret, token, bank and similar), never follows links, stores only file paths, and does nothing until entities exist in the memory. A local backup defaults to `~/agent-memory-backups/`; use `memory_backup_local.py list`, `verify` and `restore` to inspect and recover it.
 
-## Design notes
+`~/.claude/agent-kit-manifest.json` is the kit's own record of what it installed (file names and checksums). It is not a file to edit: the installer rewrites it on every run, after copying the previous one to the backup folder when it changes.
 
-- One fact per memory; corrections are stored with the reason; recall favours what gets used.
-- Always write memory through `hm_write.py`: a bare `sqlite3 INSERT` silently drops apostrophes.
-- Memory stays on this machine. `hm_write.py` can ask the Claude CLI to merge near-duplicate notes, but only
-  when you set `HM_ADJUDICATE=1`; that sends the notes involved to your Claude account.
-- The impeccable design skill ships without its live-preview mode, whose local server let other websites
-  read project files.
-- Credentials live in a private folder such as `~/keys/` and are referred to by path only.
-  The memory indexer reads only the file names there, never the contents (enforced by tests).
-- Some skills mention Claude Code; they work the same way in Codex.
+Not included: the author's memory or credentials, company tooling, a private team chat network, and Mac-only desktop automation.

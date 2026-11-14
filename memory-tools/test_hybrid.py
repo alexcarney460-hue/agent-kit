@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from contextlib import closing
 """Tests for the hybrid retrieval path: RRF fusion, PPR, embedding
 index. Standalone or pytest; no Ollama, no live stores — everything stubbed."""
 import os
@@ -12,20 +13,26 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mem_recall  # noqa: E402
 import embed_index  # noqa: E402
 import ppr as ppr_mod  # noqa: E402
-import numpy as np  # noqa: E402
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 
 class TestRRF(unittest.TestCase):
     def _fuse(self, hm=None, cm=None, fl=None, vec=None, pprl=None, sup=None, red=None):
-        with mock.patch.object(mem_recall, "hm_redirects", return_value=red or {}), \
-             mock.patch.object(mem_recall, "hivemind", return_value=hm or []), \
+        view = mock.Mock()
+        view.hivemind_redirect = red or {}
+        view.store_available.return_value = True
+        view.is_eligible.side_effect = lambda store, ref: not (store == "claudemem" and int(ref) in (sup or set()))
+        with mock.patch.object(mem_recall, "hivemind", return_value=hm or []), \
              mock.patch.object(mem_recall, "claudemem", return_value=(cm or [], "fts5")), \
              mock.patch.object(mem_recall, "files", return_value=fl or []), \
-             mock.patch.object(mem_recall, "_vector_list", return_value=vec), \
+             mock.patch.object(mem_recall, "_vector_lists", return_value=[vec] if vec else None), \
              mock.patch.object(mem_recall, "_ppr_list", return_value=pprl), \
-             mock.patch.object(mem_recall, "suppressed_obs_ids", return_value=sup or set()), \
-             mock.patch.object(mem_recall, "sem", None):
-            return mem_recall.fused_search("q", k=10)
+             mock.patch.object(mem_recall, "sem", None), \
+             mock.patch.object(mem_recall.graph_policy, "recheck", return_value=(True, "")):
+            return mem_recall.fused_search("q", k=10, view=view)
 
     def test_multi_signal_item_outranks_single_signal(self):
         hm = [(9.0, 7, 0, "context", "rule seven", False, True),
@@ -120,10 +127,14 @@ class TestPPR(unittest.TestCase):
         c.commit(); c.close()
         return path
 
+    @unittest.skipIf(np is None, "numpy/scipy optional")
     def test_seeded_entity_records_rank_first_and_hub_dilutes(self):
         path = self._toy_sem()
-        with mock.patch.object(ppr_mod, "SEM", path):
-            ranks = ppr_mod.ranks({1: 1.0}, top=50)
+        view = mock.Mock()
+        with closing(sqlite3.connect(path)) as c, c:
+            view.links = [(a, b, d, w, "legacy") for a, b, d, w in c.execute("SELECT * FROM mention")]
+            view.edges = [(a, b, "about") for a, b in c.execute("SELECT * FROM edge")]
+        ranks = ppr_mod.ranks({1: 1.0}, top=50, view=view)
         self.assertIsNotNone(ranks)
         top_keys = [k for k, _ in ranks[:2]]
         self.assertIn(("hivemind", "A"), top_keys)
@@ -141,6 +152,7 @@ class TestPPR(unittest.TestCase):
             self.assertIsNone(ppr_mod.ranks({1: 1.0}))
 
 
+@unittest.skipIf(np is None, "numpy optional")
 class TestEmbedIndex(unittest.TestCase):
     def test_incremental_skips_unchanged(self):
         with tempfile.TemporaryDirectory() as d:
@@ -210,7 +222,7 @@ class TestEmbedIndex(unittest.TestCase):
 
 
     def test_failed_store_read_never_prunes(self):
-        # HIGH-2 regression: a store that fails to read keeps ALL its rows
+        # a store that fails to read keeps ALL its rows
         with tempfile.TemporaryDirectory() as d:
             db = os.path.join(d, "emb.db")
             conn = embed_index.connect(db)
@@ -230,7 +242,7 @@ class TestEmbedIndex(unittest.TestCase):
             conn.close()
 
     def test_ragged_vector_skipped_not_stored(self):
-        # MED-3 regression: wrong-dim row must never reach the table
+        # wrong-dim row must never reach the table
         with tempfile.TemporaryDirectory() as d:
             db = os.path.join(d, "emb.db")
             conn = embed_index.connect(db)
@@ -253,6 +265,7 @@ class TestEmbedIndex(unittest.TestCase):
             self.assertEqual(rows, [("1", embed_index.DIM * 4)])
             conn.close()
 
+    @unittest.skipIf(np is None, "numpy optional")
     def test_matrix_roundtrip_and_normalization(self):
         with tempfile.TemporaryDirectory() as d:
             db = os.path.join(d, "emb.db")

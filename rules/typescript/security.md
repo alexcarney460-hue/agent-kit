@@ -25,4 +25,4 @@ if (!apiKey) {
 
 ## Agent Support
 
-- Run /security-review (built-in) for comprehensive security audits
+- Use an available security review process for comprehensive audits.

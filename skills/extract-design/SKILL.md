@@ -1,7 +1,6 @@
 ---
 name: extract-design
 description: "Extract the full design language from any website URL. Produces 8 output files including AI-optimized markdown, visual HTML preview, Tailwind config, React theme, shadcn/ui theme, Figma variables, W3C design tokens, and CSS variables. Also runs WCAG accessibility scoring. Use when user says 'extract design', 'get design system', 'design language', 'design tokens', 'what colors/fonts does this site use', or '/extract-design'."
-allowed-tools: Bash, Read, Write, Glob
 ---
 
 # Extract Design Language
@@ -11,6 +10,8 @@ Extract the complete design language from any website URL. Generates 8 output fi
 ## Prerequisites
 
 Ensure `designlang` is available. Install if needed:
+
+> Ask the user before installing anything. `designlang` is a third-party npm package; installing it globally, or running it through `npx`, downloads and runs code from the npm registry.
 
 ```bash
 npm install -g designlang

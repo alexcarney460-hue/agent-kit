@@ -7,11 +7,10 @@ paths:
 ---
 # TypeScript/JavaScript Hooks
 
-> This file extends [common/hooks.md](../common/hooks.md) with TypeScript/JavaScript specific content.
 
 ## PostToolUse Hooks
 
-Configure in `~/.claude/settings.json`:
+If these tools are already installed, consider configuring optional hooks:
 
 - **Prettier**: Auto-format JS/TS files after edit
 - **TypeScript check**: Run `tsc` after editing `.ts`/`.tsx` files
